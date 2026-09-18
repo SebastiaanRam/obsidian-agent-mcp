@@ -227,11 +227,17 @@ export class AgentTerminalView extends ItemView {
     try {
       this.pty = this.startPty(cfg, command, term.cols, term.rows);
     } catch (err) {
-      term.writeln("\x1b[31mFailed to start shell:\x1b[0m " + String(err));
-      term.writeln("");
-      term.writeln("The Python PTY bridge could not be started. Make sure a Python 3");
-      term.writeln("interpreter is available and set its path in the plugin settings");
-      term.writeln("(Settings → Agent MCP → Python path → Check).");
+      const e = err as Error & { syscall?: string };
+      term.writeln("\x1b[31mFailed to start shell:\x1b[0m " + (e.message ?? String(err)));
+      // spawnShell also throws when it can't write the bridge script (missing
+      // plugin dir, permissions) — a failure with nothing to do with Python.
+      // Only a failed process spawn (syscall "spawn...") is actually about the
+      // interpreter, so that's the only case pointing at the Python setting.
+      if (typeof e.syscall === "string" && e.syscall.startsWith("spawn")) {
+        term.writeln("");
+        term.writeln("Make sure a Python 3 interpreter is available and set its path in the");
+        term.writeln("plugin settings (Settings → Agent MCP → Python path → Check).");
+      }
       return;
     }
 

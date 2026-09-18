@@ -223,7 +223,11 @@ export default class ObsidianAgentMCP extends Plugin {
   // ── Terminal ───────────────────────────────────────────────────────────────
 
   private pluginDir(): string {
-    return join(this.basePath(), this.app.vault.configDir, "plugins", this.manifest.id);
+    // manifest.dir is the vault-relative folder Obsidian actually loaded us
+    // from (it already includes the config dir) — the folder name need not
+    // match manifest.id, e.g. after a BRAT install or a renamed dev copy.
+    const dir = this.manifest.dir ?? join(this.app.vault.configDir, "plugins", this.manifest.id);
+    return join(this.basePath(), dir);
   }
 
   private getTerminalConfig(): TerminalConfig {
