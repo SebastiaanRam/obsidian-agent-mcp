@@ -10782,11 +10782,8 @@ var AgentTerminalView = class extends import_obsidian3.ItemView {
     try {
       this.pty = this.startPty(cfg, command, term.cols, term.rows);
     } catch (err) {
-      term.writeln("\x1B[31mFailed to start shell:\x1B[0m " + String(err));
-      term.writeln("");
-      term.writeln("The Python PTY bridge could not be started. Make sure a Python 3");
-      term.writeln("interpreter is available and set its path in the plugin settings");
-      term.writeln("(Settings \u2192 Agent MCP \u2192 Python path \u2192 Check).");
+      const e = err;
+      term.writeln("\x1B[31mFailed to start shell:\x1B[0m " + (e.message ?? String(err)));
       return;
     }
     this.wirePtyToTerm(this.pty, term);
@@ -11217,7 +11214,8 @@ var ObsidianAgentMCP = class extends import_obsidian5.Plugin {
   }
   // ── Terminal ───────────────────────────────────────────────────────────────
   pluginDir() {
-    return join(this.basePath(), this.app.vault.configDir, "plugins", this.manifest.id);
+    const dir = this.manifest.dir ?? join(this.app.vault.configDir, "plugins", this.manifest.id);
+    return join(this.basePath(), dir);
   }
   getTerminalConfig() {
     const t = this.settings.terminal;
