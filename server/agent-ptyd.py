@@ -9,6 +9,20 @@ connection, so you can disconnect a phone, walk away, and reattach later to
 the same running agent. Standard library only, Python 3.9+, POSIX (Linux/
 macOS) only — like src/terminal/bridge.py, it needs pty.fork().
 
+ENVIRONMENT
+  This process is normally started by systemd, a login-item, or by hand from
+  a plain shell — none of which give it the environment a real terminal
+  login would: PATH additions from shell rc files, credential helpers'
+  cached state, etc. Left alone, a session's argv is exec'd directly with
+  whatever environment this daemon itself inherited, which is why a real
+  session can report an agent as "not logged in" despite valid host
+  credentials, or fail to resolve a locally-installed tool. Each backend
+  therefore defaults to running its argv through an interactive login shell
+  first (see normalize_backends' `login_shell`/`shell` keys and
+  _wrap_login_shell) — the same fix, for the same reason, as
+  ../src/terminal/pty.ts's agentShell() applies to the local (non-remote)
+  terminal backend.
+
 SECURITY — READ THIS BEFORE EXPOSING THIS PROCESS TO A NETWORK
   `root` in the config bounds only the *initial* working directory offered to
   a new session. It is NOT a sandbox: a shell or agent started under it can
@@ -81,6 +95,7 @@ import posixpath
 import pty
 import secrets
 import selectors
+import shlex
 import signal
 import socket
 import struct
@@ -129,6 +144,10 @@ DEFAULT_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".config", "agent-pt
 
 DEFAULT_CONFIG = {
     "root": os.path.join(os.path.expanduser("~"), "agent-ptyd-sessions"),
+    # Each value may be a plain argv list, or {"argv", "label", "login_shell",
+    # "shell"} for per-backend control — see normalize_backends. login_shell
+    # (default True) and shell (default $SHELL or /bin/bash) don't need
+    # setting explicitly here; this example only shows the plain-argv shape.
     "backends": {"shell": [os.environ.get("SHELL", "/bin/bash"), "-l"]},
     "token": None,
     "host": "127.0.0.1",
@@ -184,37 +203,59 @@ def load_config(path):
 
 def normalize_backends(raw):
     """Accepts either the legacy `{id: [argv...]}` config shape or the
-    richer `{id: {"argv": [...], "label": "..."}}` one, and returns the
-    latter uniformly — this is what Daemon.backends holds, and what /info
-    reports (id + label only; argv never leaves the process, see
-    ClientConnection._handle_info). `label` defaults to a title-cased id
-    when not given, so the legacy shape keeps working unlabeled."""
+    richer `{id: {"argv": [...], "label": ..., "login_shell": ..., "shell":
+    ...}}` one, and returns the latter uniformly — this is what
+    Daemon.backends holds, and what /info reports (id + label only; argv
+    never leaves the process, see ClientConnection._handle_info). `label`
+    defaults to a title-cased id when not given, so the legacy shape keeps
+    working unlabeled.
+
+    `login_shell` (default True) controls whether Daemon.create_session runs
+    argv through an interactive login shell (see _wrap_login_shell) instead
+    of exec'ing it directly with this daemon's own inherited environment —
+    see the module docstring's ENVIRONMENT section for why that default is
+    on. `shell` (default None, meaning $SHELL or /bin/bash) is which shell
+    binary to wrap with; both are ignored when login_shell is False."""
     if not isinstance(raw, dict) or not raw:
         raise ValueError("config.backends must be a non-empty object of id -> argv (or {argv, label})")
     out = {}
     for backend_id, spec in raw.items():
         if isinstance(spec, list):
-            argv, label = spec, None
+            argv, label, login_shell, shell = spec, None, True, None
         elif isinstance(spec, dict):
-            argv, label = spec.get("argv"), spec.get("label")
+            argv = spec.get("argv")
+            label = spec.get("label")
+            login_shell = spec.get("login_shell", True)
+            shell = spec.get("shell")
         else:
             raise ValueError("config.backends[%r] must be an argv list or an {argv, label} object" % backend_id)
         if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
             raise ValueError("config.backends[%r] must have a non-empty argv list of strings" % backend_id)
+        if not isinstance(login_shell, bool):
+            raise ValueError("config.backends[%r].login_shell must be a boolean" % backend_id)
+        if shell is not None and (not isinstance(shell, str) or not shell):
+            raise ValueError("config.backends[%r].shell must be a non-empty string" % backend_id)
         if not label:
             label = backend_id.replace("_", " ").replace("-", " ").title()
-        out[backend_id] = {"argv": argv, "label": label}
+        out[backend_id] = {"argv": argv, "label": label, "login_shell": login_shell, "shell": shell}
     return out
 
 
 def validate_backends(backends):
     normalized = normalize_backends(backends)
     for backend_id, meta in normalized.items():
+        # With login_shell on (the default), argv[0] is resolved by that
+        # shell's own PATH — exactly like typing the command into a real
+        # terminal — so a bare, non-absolute command is expected and fine.
+        # This warning only applies when that resolution isn't happening.
+        if meta["login_shell"]:
+            continue
         if not os.path.isabs(meta["argv"][0]):
             sys.stderr.write(
                 "agent-ptyd: WARNING: backend %r command %r is not an absolute\n"
-                "path — this daemon's PATH (especially under systemd) may not\n"
-                "match your login shell's PATH.\n" % (backend_id, meta["argv"][0])
+                "path and login_shell is disabled for it — this daemon's raw\n"
+                "PATH (especially under systemd) may not match your login\n"
+                "shell's PATH.\n" % (backend_id, meta["argv"][0])
             )
 
 
@@ -396,6 +437,36 @@ CLEAR_SCREEN_SEQUENCE = b"\x1b[H\x1b[2J\x1b[3J"
 
 def set_winsize(fd, rows, cols):
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+
+def _wrap_login_shell(argv, shell):
+    """Builds `<shell> -i -l -c "exec <argv...>"`, the same shape
+    src/terminal/pty.ts's agentShell() uses for the local terminal backend,
+    and for the same reason: this daemon is normally started by systemd, a
+    login item, or a plain non-interactive shell, none of which give the
+    child process the environment a real terminal login would. Without this,
+    a session sees only what THIS process inherited — which is how a real
+    session ends up reporting an agent as "not logged in" despite valid host
+    credentials, or a hook failing to resolve a tool that's on PATH in any
+    normal terminal.
+
+    `-i -l` (interactive login), not just `-l`, is deliberate: a plain login
+    shell sources .zprofile/.profile but not .zshrc/.bashrc, and tools are
+    commonly put on PATH (or credential state cached) in the latter — see
+    agentShell()'s comment in pty.ts, which this mirrors exactly.
+
+    argv is always server-config-controlled (Daemon.create_session builds it
+    from self.backends, never from anything a client sends — see
+    normalize_backends), so this is not a client-facing shell-injection
+    surface. But building a shell -c STRING out of an argv LIST introduces
+    one anyway if done naively: each element is individually shlex.quote()'d
+    before joining, so an argument containing shell metacharacters is passed
+    through to the final command inertly, exactly as os.execvp(argv) would
+    have handled it — the shell layer here exists only to source profile
+    files, never to reinterpret argv.
+    """
+    quoted = " ".join(shlex.quote(a) for a in argv)
+    return [shell, "-i", "-l", "-c", "exec " + quoted]
 
 
 def _spawn_pty(argv, cwd, cols, rows):
@@ -1200,7 +1271,11 @@ class Daemon(object):
         if len(self._create_timestamps) >= self.config["session_create_rate_per_min"]:
             raise SessionLimitError("session creation rate limit exceeded")
 
-        argv = self.backends[backend]["argv"]
+        meta = self.backends[backend]
+        argv = meta["argv"]
+        if meta["login_shell"]:
+            shell = meta["shell"] or os.environ.get("SHELL", "/bin/bash")
+            argv = _wrap_login_shell(argv, shell)
         session_id = uuid.uuid4().hex
         session = PtySession(session_id, backend, canon_cwd, cwd_rel, argv, cols, rows)
         self.sessions[session_id] = session

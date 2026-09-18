@@ -321,7 +321,7 @@ class ControlProtocolTests(unittest.TestCase):
 
     def test_reattach_mismatched_backend_rejected(self):
         daemon = make_daemon(token="right")
-        daemon.backends["other"] = {"argv": ["/bin/sh"], "label": "Other"}
+        daemon.backends["other"] = {"argv": ["/bin/sh"], "label": "Other", "login_shell": True, "shell": None}
         session = make_fake_session(daemon, backend="shell", cwd=daemon.config["root"], cwd_rel=".")
         conn = make_conn(daemon)
         do_hello(conn, daemon)
@@ -743,7 +743,9 @@ class TruncatedHistoryTests(unittest.TestCase):
 class NormalizeBackendsTests(unittest.TestCase):
     def test_legacy_argv_list_gets_a_derived_label(self):
         out = agent_ptyd.normalize_backends({"claude_code": ["/usr/bin/claude"]})
-        self.assertEqual(out, {"claude_code": {"argv": ["/usr/bin/claude"], "label": "Claude Code"}})
+        self.assertEqual(out, {"claude_code": {
+            "argv": ["/usr/bin/claude"], "label": "Claude Code", "login_shell": True, "shell": None,
+        }})
 
     def test_explicit_label_is_kept(self):
         out = agent_ptyd.normalize_backends({"shell": {"argv": ["/bin/sh"], "label": "Plain Shell"}})
@@ -764,6 +766,113 @@ class NormalizeBackendsTests(unittest.TestCase):
     def test_rejects_empty_backends(self):
         with self.assertRaises(ValueError):
             agent_ptyd.normalize_backends({})
+
+    def test_login_shell_defaults_true_shell_defaults_none(self):
+        out = agent_ptyd.normalize_backends({"claude": ["/usr/bin/claude"]})
+        self.assertTrue(out["claude"]["login_shell"])
+        self.assertIsNone(out["claude"]["shell"])
+
+    def test_login_shell_can_be_opted_out(self):
+        out = agent_ptyd.normalize_backends({"raw": {"argv": ["/bin/true"], "login_shell": False}})
+        self.assertFalse(out["raw"]["login_shell"])
+
+    def test_shell_override_is_kept(self):
+        out = agent_ptyd.normalize_backends({"claude": {"argv": ["/usr/bin/claude"], "shell": "/bin/zsh"}})
+        self.assertEqual(out["claude"]["shell"], "/bin/zsh")
+
+    def test_rejects_non_bool_login_shell(self):
+        with self.assertRaises(ValueError):
+            agent_ptyd.normalize_backends({"claude": {"argv": ["/usr/bin/claude"], "login_shell": "yes"}})
+
+    def test_rejects_empty_shell_override(self):
+        with self.assertRaises(ValueError):
+            agent_ptyd.normalize_backends({"claude": {"argv": ["/usr/bin/claude"], "shell": ""}})
+
+
+# ── login-shell environment wrapping ────────────────────────────────────────
+#
+# Daemon.create_session runs a backend's argv through an interactive login
+# shell by default so the session sees the environment a real terminal login
+# would (PATH from .zshrc, cached credential state, ...) rather than
+# whatever this daemon process itself inherited — see the module docstring's
+# ENVIRONMENT section and _wrap_login_shell's docstring. These tests never
+# spawn a real shell: _spawn_pty (the actual pty.fork() call) is monkeypatched
+# to capture the argv it receives and hand back a real-but-inert pipe fd, so
+# Daemon.create_session and PtySession.__init__ run for real while nothing
+# is actually exec'd.
+
+class LoginShellWrapTests(unittest.TestCase):
+    def test_wraps_argv_as_interactive_login_shell(self):
+        argv = agent_ptyd._wrap_login_shell(["/usr/local/bin/claude", "--flag"], "/bin/zsh")
+        self.assertEqual(argv, ["/bin/zsh", "-i", "-l", "-c", "exec /usr/local/bin/claude --flag"])
+
+    def test_quotes_arguments_so_they_cannot_be_reinterpreted_by_the_shell(self):
+        # A dangerous-looking argument must survive as one inert, single-quoted
+        # token in the -c string -- never unquoted where the shell could expand
+        # or execute it as its own syntax.
+        argv = agent_ptyd._wrap_login_shell(["/usr/bin/echo", "hello world", "$(rm -rf /)"], "/bin/bash")
+        self.assertEqual(argv[:4], ["/bin/bash", "-i", "-l", "-c"])
+        self.assertEqual(argv[4], "exec /usr/bin/echo 'hello world' '$(rm -rf /)'")
+
+
+def _fake_spawn_pty_capturing(captured):
+    """Replaces agent_ptyd._spawn_pty for the duration of a test: records the
+    argv it was called with and returns a real (but never-written-to) pipe
+    read-fd in place of a pty master fd, so PtySession.__init__'s
+    os.set_blocking(self.master_fd, False) has something real to act on
+    without ever forking or exec'ing anything."""
+    def fake(argv, cwd, cols, rows):
+        captured["argv"] = argv
+        r, w = os.pipe()
+        os.close(w)
+        return 999999, r
+    return fake
+
+
+class CreateSessionLoginShellTests(unittest.TestCase):
+    def test_create_session_wraps_argv_by_default(self):
+        daemon = make_daemon(token="right")
+        daemon.backends = agent_ptyd.normalize_backends({"claude": ["/usr/local/bin/claude", "--flag"]})
+        captured = {}
+        real_spawn, agent_ptyd._spawn_pty = agent_ptyd._spawn_pty, _fake_spawn_pty_capturing(captured)
+        try:
+            session = daemon.create_session("claude", daemon.config["root"], ".", 80, 24)
+        finally:
+            agent_ptyd._spawn_pty = real_spawn
+        os.close(session.master_fd)
+        expected_shell = os.environ.get("SHELL", "/bin/bash")
+        self.assertEqual(
+            captured["argv"],
+            [expected_shell, "-i", "-l", "-c", "exec /usr/local/bin/claude --flag"],
+        )
+
+    def test_create_session_respects_login_shell_false(self):
+        daemon = make_daemon(token="right")
+        daemon.backends = agent_ptyd.normalize_backends(
+            {"raw": {"argv": ["/bin/true"], "login_shell": False}}
+        )
+        captured = {}
+        real_spawn, agent_ptyd._spawn_pty = agent_ptyd._spawn_pty, _fake_spawn_pty_capturing(captured)
+        try:
+            session = daemon.create_session("raw", daemon.config["root"], ".", 80, 24)
+        finally:
+            agent_ptyd._spawn_pty = real_spawn
+        os.close(session.master_fd)
+        self.assertEqual(captured["argv"], ["/bin/true"])
+
+    def test_create_session_respects_per_backend_shell_override(self):
+        daemon = make_daemon(token="right")
+        daemon.backends = agent_ptyd.normalize_backends(
+            {"claude": {"argv": ["/usr/local/bin/claude"], "shell": "/bin/zsh"}}
+        )
+        captured = {}
+        real_spawn, agent_ptyd._spawn_pty = agent_ptyd._spawn_pty, _fake_spawn_pty_capturing(captured)
+        try:
+            session = daemon.create_session("claude", daemon.config["root"], ".", 80, 24)
+        finally:
+            agent_ptyd._spawn_pty = real_spawn
+        os.close(session.master_fd)
+        self.assertEqual(captured["argv"][0], "/bin/zsh")
 
 
 # ── GET /info ────────────────────────────────────────────────────────────────

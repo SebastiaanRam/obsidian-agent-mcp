@@ -31,24 +31,33 @@ const SUPPORTED_MCP_PROTOCOL_VERSIONS = new Set([
 
 // ── Lock file ────────────────────────────────────────────────────────────────
 
-const LOCK_DIR = join(homedir(), ".claude", "ide");
+// A function, not a module-scope const: join()/homedir() go through nodeApi's
+// lazy require wrappers (see nodeApi.ts), and a top-level `const LOCK_DIR =
+// join(...)` would call them the instant this module is imported — on mobile,
+// before any Platform.isMobile guard runs. Every caller below is already
+// gated on desktop-only code paths, so resolving this on each call is safe.
+function lockDir(): string {
+  return join(homedir(), ".claude", "ide");
+}
 
 function createLockFile(port: number, pid: number, vaultPath: string, authToken: string) {
-  mkdirSync(LOCK_DIR, { recursive: true });
-  const tmp = join(LOCK_DIR, `${port}.lock.tmp`);
-  const lockPath = join(LOCK_DIR, `${port}.lock`);
+  const dir = lockDir();
+  mkdirSync(dir, { recursive: true });
+  const tmp = join(dir, `${port}.lock.tmp`);
+  const lockPath = join(dir, `${port}.lock`);
   writeFileSync(tmp, JSON.stringify({ pid, port, workspaceFolders: [vaultPath], ideName: "Obsidian", transport: "ws", authToken }));
   renameSync(tmp, lockPath);
 }
 
 function removeLockFile(port: number) {
-  try { unlinkSync(join(LOCK_DIR, `${port}.lock`)); } catch { /* already gone */ }
+  try { unlinkSync(join(lockDir(), `${port}.lock`)); } catch { /* already gone */ }
 }
 
 function cleanStaleLockFiles() {
   try {
-    for (const file of readdirSync(LOCK_DIR).filter(f => f.endsWith(".lock"))) {
-      const p = join(LOCK_DIR, file);
+    const dir = lockDir();
+    for (const file of readdirSync(dir).filter(f => f.endsWith(".lock"))) {
+      const p = join(dir, file);
       try {
         const data = JSON.parse(readFileSync(p, "utf-8")) as { ideName?: string; pid?: number };
         if (data.ideName !== "Obsidian") continue;
@@ -133,20 +142,29 @@ export default class ObsidianAgentMCP extends Plugin {
     await this.loadSettings();
     this.addSettingTab(new AgentMCPSettingsTab(this.app, this));
 
-    cleanStaleLockFiles();
-    this.authToken = randomUUID();
-    this.port = await this.startServer();
-    const vaultPath = this.basePath();
-    createLockFile(this.port, process.pid, vaultPath, this.authToken);
+    // The WebSocket + MCP HTTP servers and the ~/.claude/ide lock file all go
+    // through nodeApi's node:fs/node:http/node:crypto wrappers, which throw on
+    // mobile — there is no `require` there (see nodeApi.ts). Nothing routes
+    // this over a remote connection yet, so skip the whole IDE-connection path
+    // on mobile rather than crash plugin load; the terminal view still
+    // registers below; it just can't spawn a local shell there either (see
+    // terminal/view.ts).
+    if (!Platform.isMobile) {
+      cleanStaleLockFiles();
+      this.authToken = randomUUID();
+      this.port = await this.startServer();
+      const vaultPath = this.basePath();
+      createLockFile(this.port, process.pid, vaultPath, this.authToken);
 
-    // The lock file is how Claude Code discovers Obsidian as an "IDE". Other
-    // Claude Code instances housekeep ~/.claude/ide/ and can remove our lock,
-    // which silently kills selection streaming until the next plugin reload.
-    // Re-assert it on a slow interval so a deleted lock self-heals.
-    this.lockRefreshInterval = window.setInterval(() => {
-      if (existsSync(join(LOCK_DIR, `${this.port}.lock`))) return;
-      try { createLockFile(this.port, process.pid, vaultPath, this.authToken); } catch { /* best-effort re-assert */ }
-    }, 10_000);
+      // The lock file is how Claude Code discovers Obsidian as an "IDE". Other
+      // Claude Code instances housekeep ~/.claude/ide/ and can remove our lock,
+      // which silently kills selection streaming until the next plugin reload.
+      // Re-assert it on a slow interval so a deleted lock self-heals.
+      this.lockRefreshInterval = window.setInterval(() => {
+        if (existsSync(join(lockDir(), `${this.port}.lock`))) return;
+        try { createLockFile(this.port, process.pid, vaultPath, this.authToken); } catch { /* best-effort re-assert */ }
+      }, 10_000);
+    }
 
     this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.scheduleBroadcast()));
     this.registerDomEvent(window, "focus", () => { this.prevStateKey = null; this.scheduleBroadcast(); });
@@ -177,7 +195,7 @@ export default class ObsidianAgentMCP extends Plugin {
 
     this.addRibbonIcon("bot", "Open agent terminal", () => void this.openTerminalView());
 
-    this.startMcpHttpServer();
+    if (!Platform.isMobile) this.startMcpHttpServer();
   }
 
   onunload() {
@@ -253,9 +271,14 @@ export default class ObsidianAgentMCP extends Plugin {
     // without a probe (see ensureBackendAvailability's mobile branch).
     if (Platform.isMobile) void this.ensureBackendAvailability("remote");
     return {
-      pluginDir: this.pluginDir(),
+      // Desktop-only (see TerminalConfig in terminal/view.ts): both feed
+      // startPty()'s local pty spawn, which mobile never reaches. Leaving them
+      // unset there avoids resolving join()/homedir() through nodeApi, which
+      // has nothing to resolve on mobile — and this method runs unconditionally
+      // from onOpen(), before that mobile check.
+      pluginDir: Platform.isMobile ? undefined : this.pluginDir(),
+      cwd: Platform.isMobile ? undefined : (t.cwd === "home" ? homedir() : this.basePath()),
       pythonPath: t.pythonPath,
-      cwd: t.cwd === "home" ? homedir() : this.basePath(),
       shell: t.shell.trim() || undefined,
       shellArgs,
       fontSize: t.fontSize,

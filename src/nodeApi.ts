@@ -6,24 +6,47 @@
  * @types/node is declared), so every value imported from a Node builtin is
  * `any` there, and each use trips the review's type-checked no-unsafe-*
  * rules — hundreds of false positives across the plugin's fs/net/terminal
- * code. Importing each builtin exactly once here and asserting it to a
- * structural type keeps every other line of the plugin fully typed in both
- * environments. The interfaces describe only the API surface the plugin
- * actually uses; `npm run typecheck` (with real @types/node installed)
- * still validates these shapes and all call sites against the real types.
+ * code. Asserting each builtin to a structural type here keeps every other
+ * line of the plugin fully typed in both environments. The interfaces
+ * describe only the API surface the plugin actually uses; `npm run
+ * typecheck` (with real @types/node installed) still validates these shapes
+ * and all call sites against the real types.
  *
- * The assertions are type-level only: the bundled output is identical to
- * importing the builtins directly.
+ * Node builtins are also resolved lazily, on first use, rather than at
+ * module load: Obsidian mobile has no `require` for them at all (there is no
+ * Node runtime), and a static top-level `import * as nodeFs from "node:fs"`
+ * — which esbuild turns into a top-level `require("node:fs")` in the bundle
+ * — throws the instant the plugin loads, taking the whole plugin down with
+ * it. Every export below is a thin wrapper that only touches `window.require`
+ * when actually called, so requiring this module (as main.ts does at its own
+ * top level) is safe on every platform; only *calling* a desktop-only export
+ * from a still-unguarded mobile code path fails, and it fails with a clear
+ * error rather than a silent crash at load. Going through `window.require`
+ * rather than a bare `require(id)` also keeps esbuild from statically
+ * analysing and re-inlining the dependency, which would reintroduce the
+ * top-level require it's meant to avoid.
+ *
+ * The assertions are type-level only: the bundled output for every call site
+ * elsewhere in the plugin is unchanged.
  */
 
-import * as nodeFs from "node:fs";
-import * as nodePath from "node:path";
-import * as nodeOs from "node:os";
-import * as nodeCrypto from "node:crypto";
-import * as nodeHttp from "node:http";
-import * as nodeChildProcess from "node:child_process";
-import * as nodeStringDecoder from "node:string_decoder";
-import { Buffer as nodeBuffer } from "node:buffer";
+// Resolves one Node builtin by id via window.require, memoizing the result so
+// repeated calls don't re-require. Absent on mobile (no Node runtime), in
+// which case we throw a clear, module-naming error instead of letting the
+// call site fail on `undefined.someMethod`.
+function lazyModule<T>(id: string): () => T {
+  let mod: T | undefined;
+  return () => {
+    if (mod === undefined) {
+      const req = (window as unknown as { require?: (id: string) => unknown }).require;
+      if (!req) {
+        throw new Error(`[agent-mcp] "${id}" is unavailable: Node.js APIs don't exist on this platform (e.g. Obsidian mobile)`);
+      }
+      mod = req(id) as T;
+    }
+    return mod;
+  };
+}
 
 // ── Buffer ───────────────────────────────────────────────────────────────────
 
@@ -44,7 +67,13 @@ interface BufferConstructor {
   from(data: string | Buffer): Buffer;
 }
 
-export const Buffer = nodeBuffer as unknown as BufferConstructor;
+const bufferModule = lazyModule<{ Buffer: BufferConstructor }>("node:buffer");
+
+export const Buffer: BufferConstructor = {
+  alloc: size => bufferModule().Buffer.alloc(size),
+  concat: list => bufferModule().Buffer.concat(list),
+  from: data => bufferModule().Buffer.from(data),
+};
 
 // ── process ──────────────────────────────────────────────────────────────────
 
@@ -57,9 +86,12 @@ interface ProcessLike {
   kill(pid: number, signal: number | string): boolean;
 }
 
-// The renderer window exposes Node's `process` (Obsidian runs plugins with
-// Node integration); grabbing it off `window` keeps this module free of any
-// direct global that only @types/node declares.
+// The renderer window exposes Node's `process` directly (Obsidian desktop runs
+// plugins with Node integration) rather than through `require`, so this isn't
+// part of the lazy-require scheme above: reading a possibly-absent property off
+// `window` can't throw. On mobile this is simply `undefined` — callers that may
+// run on mobile must check `Platform.isMobile` before touching it, same as any
+// other desktop-only export here.
 export const process = (
   window as unknown as { process?: unknown }
 ).process as ProcessLike;
@@ -76,8 +108,15 @@ interface FsModule {
   existsSync: (path: string) => boolean;
 }
 
-const fs = nodeFs as unknown as FsModule;
-export const { writeFileSync, renameSync, unlinkSync, readdirSync, readFileSync, mkdirSync, existsSync } = fs;
+const fs = lazyModule<FsModule>("node:fs");
+
+export function writeFileSync(path: string, data: string): void { fs().writeFileSync(path, data); }
+export function renameSync(oldPath: string, newPath: string): void { fs().renameSync(oldPath, newPath); }
+export function unlinkSync(path: string): void { fs().unlinkSync(path); }
+export function readdirSync(path: string): string[] { return fs().readdirSync(path); }
+export function readFileSync(path: string, encoding: string): string { return fs().readFileSync(path, encoding); }
+export function mkdirSync(path: string, options?: { recursive?: boolean }): void { fs().mkdirSync(path, options); }
+export function existsSync(path: string): boolean { return fs().existsSync(path); }
 
 // ── path / os ────────────────────────────────────────────────────────────────
 
@@ -89,8 +128,11 @@ interface OsModule {
   homedir: () => string;
 }
 
-export const { join } = nodePath as unknown as PathModule;
-export const { homedir } = nodeOs as unknown as OsModule;
+const pathModule = lazyModule<PathModule>("node:path");
+const osModule = lazyModule<OsModule>("node:os");
+
+export function join(...paths: string[]): string { return pathModule().join(...paths); }
+export function homedir(): string { return osModule().homedir(); }
 
 // ── crypto ───────────────────────────────────────────────────────────────────
 
@@ -104,7 +146,10 @@ interface CryptoModule {
   createHash: (algorithm: string) => Hash;
 }
 
-export const { randomUUID, createHash } = nodeCrypto as unknown as CryptoModule;
+const cryptoModule = lazyModule<CryptoModule>("node:crypto");
+
+export function randomUUID(): string { return cryptoModule().randomUUID(); }
+export function createHash(algorithm: string): Hash { return cryptoModule().createHash(algorithm); }
 
 // ── http / net ───────────────────────────────────────────────────────────────
 
@@ -144,7 +189,11 @@ interface HttpModule {
   createServer: (handler: (req: IncomingMessage, res: ServerResponse) => void) => Server;
 }
 
-export const { createServer } = nodeHttp as unknown as HttpModule;
+const httpModule = lazyModule<HttpModule>("node:http");
+
+export function createServer(handler: (req: IncomingMessage, res: ServerResponse) => void): Server {
+  return httpModule().createServer(handler);
+}
 
 // ── child_process ────────────────────────────────────────────────────────────
 
@@ -180,7 +229,24 @@ interface ChildProcessModule {
   ) => void;
 }
 
-export const { spawn, execFile } = nodeChildProcess as unknown as ChildProcessModule;
+const childProcessModule = lazyModule<ChildProcessModule>("node:child_process");
+
+export function spawn(
+  command: string,
+  args: readonly string[],
+  options: { cwd?: string; env?: EnvVars; stdio?: readonly string[] },
+): ChildProcess {
+  return childProcessModule().spawn(command, args, options);
+}
+
+export function execFile(
+  command: string,
+  args: readonly string[],
+  options: { timeout?: number },
+  callback: (err: Error | null, stdout: string) => void,
+): void {
+  childProcessModule().execFile(command, args, options, callback);
+}
 
 // ── string_decoder ───────────────────────────────────────────────────────────
 
@@ -192,5 +258,21 @@ interface StringDecoderModule {
   StringDecoder: new (encoding: string) => StringDecoderInstance;
 }
 
-export const { StringDecoder } = nodeStringDecoder as unknown as StringDecoderModule;
-export type StringDecoder = StringDecoderInstance;
+const stringDecoderModule = lazyModule<StringDecoderModule>("node:string_decoder");
+
+// A thin class rather than a re-exported constructor, so `new StringDecoder(...)`
+// only resolves node:string_decoder when actually constructed, not at import
+// time. The class doubles as the instance type (as the old destructured export
+// did via `export type StringDecoder = StringDecoderInstance`), so callers that
+// write `new StringDecoder("utf8")` see no difference.
+export class StringDecoder implements StringDecoderInstance {
+  private readonly inner: StringDecoderInstance;
+
+  constructor(encoding: string) {
+    this.inner = new (stringDecoderModule().StringDecoder)(encoding);
+  }
+
+  write(buffer: Buffer): string {
+    return this.inner.write(buffer);
+  }
+}

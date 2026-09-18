@@ -15,9 +15,13 @@ export const AGENT_TERMINAL_VIEW_TYPE = "agent-terminal";
 const RESIZE_DEBOUNCE_MS = 60;
 
 export interface TerminalConfig {
-  pluginDir: string;
+  // Desktop-only: read only by startPty() to spawn a local pty, which never
+  // happens on mobile (see the Platform.isMobile check in startSession()).
+  // getTerminalConfig() (main.ts) leaves both unset there rather than resolve
+  // them through nodeApi, which has nothing to resolve on mobile.
+  pluginDir?: string;
   pythonPath?: string;
-  cwd: string;
+  cwd?: string;
   shell?: string;
   shellArgs?: string[];
   fontFamily?: string;
@@ -432,6 +436,12 @@ export class AgentTerminalView extends ItemView {
   }
 
   private startPty(cfg: TerminalConfig, command: string, cols: number, rows: number): IPty {
+    // Only reachable on desktop: startSession() never takes this path on
+    // mobile (backend is forced to "remote" there), so pluginDir/cwd
+    // (desktop-only, see TerminalConfig) are always set here even though the
+    // type allows undefined for the mobile case.
+    if (!cfg.pluginDir || !cfg.cwd) throw new Error("startPty: missing pluginDir/cwd (unreachable on mobile)");
+
     const cmd = command.trim();
     // Launch straight into the agent (never a bare shell). If no command resolves
     // (plain terminal, or a missing-CLI fallback), use an interactive login shell.

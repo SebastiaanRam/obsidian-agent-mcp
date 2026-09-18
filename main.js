@@ -10064,24 +10064,84 @@ module.exports = __toCommonJS(main_exports);
 var import_obsidian6 = require("obsidian");
 
 // src/nodeApi.ts
-var nodeFs = __toESM(require("node:fs"));
-var nodePath = __toESM(require("node:path"));
-var nodeOs = __toESM(require("node:os"));
-var nodeCrypto = __toESM(require("node:crypto"));
-var nodeHttp = __toESM(require("node:http"));
-var nodeChildProcess = __toESM(require("node:child_process"));
-var nodeStringDecoder = __toESM(require("node:string_decoder"));
-var import_node_buffer = require("node:buffer");
-var Buffer2 = import_node_buffer.Buffer;
+function lazyModule(id) {
+  let mod;
+  return () => {
+    if (mod === void 0) {
+      const req = window.require;
+      if (!req) {
+        throw new Error(`[agent-mcp] "${id}" is unavailable: Node.js APIs don't exist on this platform (e.g. Obsidian mobile)`);
+      }
+      mod = req(id);
+    }
+    return mod;
+  };
+}
+var bufferModule = lazyModule("node:buffer");
+var Buffer2 = {
+  alloc: (size) => bufferModule().Buffer.alloc(size),
+  concat: (list) => bufferModule().Buffer.concat(list),
+  from: (data) => bufferModule().Buffer.from(data)
+};
 var process2 = window.process;
-var fs = nodeFs;
-var { writeFileSync, renameSync, unlinkSync, readdirSync, readFileSync, mkdirSync, existsSync } = fs;
-var { join } = nodePath;
-var { homedir } = nodeOs;
-var { randomUUID, createHash } = nodeCrypto;
-var { createServer } = nodeHttp;
-var { spawn, execFile } = nodeChildProcess;
-var { StringDecoder } = nodeStringDecoder;
+var fs = lazyModule("node:fs");
+function writeFileSync(path, data) {
+  fs().writeFileSync(path, data);
+}
+function renameSync(oldPath, newPath) {
+  fs().renameSync(oldPath, newPath);
+}
+function unlinkSync(path) {
+  fs().unlinkSync(path);
+}
+function readdirSync(path) {
+  return fs().readdirSync(path);
+}
+function readFileSync(path, encoding) {
+  return fs().readFileSync(path, encoding);
+}
+function mkdirSync(path, options) {
+  fs().mkdirSync(path, options);
+}
+function existsSync(path) {
+  return fs().existsSync(path);
+}
+var pathModule = lazyModule("node:path");
+var osModule = lazyModule("node:os");
+function join(...paths) {
+  return pathModule().join(...paths);
+}
+function homedir() {
+  return osModule().homedir();
+}
+var cryptoModule = lazyModule("node:crypto");
+function randomUUID() {
+  return cryptoModule().randomUUID();
+}
+function createHash(algorithm) {
+  return cryptoModule().createHash(algorithm);
+}
+var httpModule = lazyModule("node:http");
+function createServer(handler) {
+  return httpModule().createServer(handler);
+}
+var childProcessModule = lazyModule("node:child_process");
+function spawn(command, args, options) {
+  return childProcessModule().spawn(command, args, options);
+}
+function execFile(command, args, options, callback) {
+  childProcessModule().execFile(command, args, options, callback);
+}
+var stringDecoderModule = lazyModule("node:string_decoder");
+var StringDecoder = class {
+  inner;
+  constructor(encoding) {
+    this.inner = new (stringDecoderModule()).StringDecoder(encoding);
+  }
+  write(buffer) {
+    return this.inner.write(buffer);
+  }
+};
 
 // src/settings.ts
 var import_obsidian2 = require("obsidian");
@@ -11436,6 +11496,7 @@ var AgentTerminalView = class extends import_obsidian4.ItemView {
     }
   }
   startPty(cfg, command, cols, rows) {
+    if (!cfg.pluginDir || !cfg.cwd) throw new Error("startPty: missing pluginDir/cwd (unreachable on mobile)");
     const cmd = command.trim();
     const { file, args } = cmd ? agentShell(cmd, cfg.shell, cfg.shellArgs) : cfg.shell ? { file: cfg.shell, args: cfg.shellArgs ?? [] } : defaultShell();
     return spawnShell({
@@ -11616,24 +11677,28 @@ var SUPPORTED_MCP_PROTOCOL_VERSIONS = /* @__PURE__ */ new Set([
   "2025-06-18",
   "2025-11-25"
 ]);
-var LOCK_DIR = join(homedir(), ".claude", "ide");
+function lockDir() {
+  return join(homedir(), ".claude", "ide");
+}
 function createLockFile(port, pid, vaultPath, authToken) {
-  mkdirSync(LOCK_DIR, { recursive: true });
-  const tmp = join(LOCK_DIR, `${port}.lock.tmp`);
-  const lockPath = join(LOCK_DIR, `${port}.lock`);
+  const dir = lockDir();
+  mkdirSync(dir, { recursive: true });
+  const tmp = join(dir, `${port}.lock.tmp`);
+  const lockPath = join(dir, `${port}.lock`);
   writeFileSync(tmp, JSON.stringify({ pid, port, workspaceFolders: [vaultPath], ideName: "Obsidian", transport: "ws", authToken }));
   renameSync(tmp, lockPath);
 }
 function removeLockFile(port) {
   try {
-    unlinkSync(join(LOCK_DIR, `${port}.lock`));
+    unlinkSync(join(lockDir(), `${port}.lock`));
   } catch {
   }
 }
 function cleanStaleLockFiles() {
   try {
-    for (const file of readdirSync(LOCK_DIR).filter((f) => f.endsWith(".lock"))) {
-      const p = join(LOCK_DIR, file);
+    const dir = lockDir();
+    for (const file of readdirSync(dir).filter((f) => f.endsWith(".lock"))) {
+      const p = join(dir, file);
       try {
         const data = JSON.parse(readFileSync(p, "utf-8"));
         if (data.ideName !== "Obsidian") continue;
@@ -11724,18 +11789,20 @@ var ObsidianAgentMCP = class extends import_obsidian6.Plugin {
   async onload() {
     await this.loadSettings();
     this.addSettingTab(new AgentMCPSettingsTab(this.app, this));
-    cleanStaleLockFiles();
-    this.authToken = randomUUID();
-    this.port = await this.startServer();
-    const vaultPath = this.basePath();
-    createLockFile(this.port, process2.pid, vaultPath, this.authToken);
-    this.lockRefreshInterval = window.setInterval(() => {
-      if (existsSync(join(LOCK_DIR, `${this.port}.lock`))) return;
-      try {
-        createLockFile(this.port, process2.pid, vaultPath, this.authToken);
-      } catch {
-      }
-    }, 1e4);
+    if (!import_obsidian6.Platform.isMobile) {
+      cleanStaleLockFiles();
+      this.authToken = randomUUID();
+      this.port = await this.startServer();
+      const vaultPath = this.basePath();
+      createLockFile(this.port, process2.pid, vaultPath, this.authToken);
+      this.lockRefreshInterval = window.setInterval(() => {
+        if (existsSync(join(lockDir(), `${this.port}.lock`))) return;
+        try {
+          createLockFile(this.port, process2.pid, vaultPath, this.authToken);
+        } catch {
+        }
+      }, 1e4);
+    }
     this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.scheduleBroadcast()));
     this.registerDomEvent(window, "focus", () => {
       this.prevStateKey = null;
@@ -11762,7 +11829,7 @@ var ObsidianAgentMCP = class extends import_obsidian6.Plugin {
       callback: () => void this.openTerminalView()
     });
     this.addRibbonIcon("bot", "Open agent terminal", () => void this.openTerminalView());
-    this.startMcpHttpServer();
+    if (!import_obsidian6.Platform.isMobile) this.startMcpHttpServer();
   }
   onunload() {
     if (this.broadcastTimer) window.clearTimeout(this.broadcastTimer);
@@ -11817,9 +11884,14 @@ var ObsidianAgentMCP = class extends import_obsidian6.Plugin {
     }
     if (import_obsidian6.Platform.isMobile) void this.ensureBackendAvailability("remote");
     return {
-      pluginDir: this.pluginDir(),
+      // Desktop-only (see TerminalConfig in terminal/view.ts): both feed
+      // startPty()'s local pty spawn, which mobile never reaches. Leaving them
+      // unset there avoids resolving join()/homedir() through nodeApi, which
+      // has nothing to resolve on mobile — and this method runs unconditionally
+      // from onOpen(), before that mobile check.
+      pluginDir: import_obsidian6.Platform.isMobile ? void 0 : this.pluginDir(),
+      cwd: import_obsidian6.Platform.isMobile ? void 0 : t.cwd === "home" ? homedir() : this.basePath(),
       pythonPath: t.pythonPath,
-      cwd: t.cwd === "home" ? homedir() : this.basePath(),
       shell: t.shell.trim() || void 0,
       shellArgs,
       fontSize: t.fontSize,
