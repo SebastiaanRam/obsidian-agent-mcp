@@ -12,7 +12,11 @@ const BRIDGE_FILENAME = ".pty-bridge.py";
 // with the plugin, so it installs cleanly through the community directory.
 export interface IPty {
   onData(cb: (data: string) => void): { dispose(): void };
-  onExit(cb: (evt: { exitCode: number; signal?: number }) => void): { dispose(): void };
+  // signal is `number | string` because backends disagree on shape: the
+  // local Python bridge surfaces Node's signal string, and the remote
+  // backend (remote.ts) surfaces the daemon's signal string too — neither
+  // needs to be coerced to a number just to fit a narrower type.
+  onExit(cb: (evt: { exitCode: number; signal?: number | string }) => void): { dispose(): void };
   resize(cols: number, rows: number): void;
   write(data: string): void;
   kill(signal?: string): void;
@@ -31,7 +35,7 @@ export interface SpawnShellOptions {
 
 class PythonPty implements IPty {
   private dataCbs = new Set<(d: string) => void>();
-  private exitCbs = new Set<(e: { exitCode: number; signal?: number }) => void>();
+  private exitCbs = new Set<(e: { exitCode: number; signal?: number | string }) => void>();
   private decoder = new StringDecoder("utf8");
   private control: Writable | null;
   private exited = false;
@@ -62,7 +66,7 @@ class PythonPty implements IPty {
   private fireExit(exitCode: number, signal?: string): void {
     if (this.exited) return;
     this.exited = true;
-    for (const cb of this.exitCbs) cb({ exitCode, signal: signal as unknown as number });
+    for (const cb of this.exitCbs) cb({ exitCode, signal });
   }
 
   onData(cb: (data: string) => void) {
@@ -70,7 +74,7 @@ class PythonPty implements IPty {
     return { dispose: () => { this.dataCbs.delete(cb); } };
   }
 
-  onExit(cb: (evt: { exitCode: number; signal?: number }) => void) {
+  onExit(cb: (evt: { exitCode: number; signal?: number | string }) => void) {
     this.exitCbs.add(cb);
     return { dispose: () => { this.exitCbs.delete(cb); } };
   }

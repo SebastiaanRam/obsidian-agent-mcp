@@ -10061,7 +10061,7 @@ __export(main_exports, {
   default: () => ObsidianAgentMCP
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian5 = require("obsidian");
+var import_obsidian6 = require("obsidian");
 
 // src/nodeApi.ts
 var nodeFs = __toESM(require("node:fs"));
@@ -10084,7 +10084,7 @@ var { spawn, execFile } = nodeChildProcess;
 var { StringDecoder } = nodeStringDecoder;
 
 // src/settings.ts
-var import_obsidian = require("obsidian");
+var import_obsidian2 = require("obsidian");
 
 // src/terminal/bridge.py
 var bridge_default = `#!/usr/bin/env python3
@@ -10324,6 +10324,412 @@ function checkPython(pythonPath) {
   });
 }
 
+// src/terminal/remote.ts
+var import_obsidian = require("obsidian");
+var PROTOCOL_VERSION = 1;
+var BASE_RECONNECT_DELAY_MS = 500;
+var MAX_RECONNECT_DELAY_MS = 15e3;
+var MAX_RECONNECT_ATTEMPTS = 10;
+var HEARTBEAT_INTERVAL_MS = 2e4;
+var MAX_PENDING_WRITE_CHARS = 65536;
+function clampDim(n) {
+  return Math.max(1, Math.min(1e3, Math.floor(n) || 1));
+}
+function toAttachUrl(base) {
+  let url = base.trim().replace(/\/+$/, "");
+  if (/^https:\/\//i.test(url)) url = "wss://" + url.slice("https://".length);
+  else if (/^http:\/\//i.test(url)) url = "ws://" + url.slice("http://".length);
+  else if (!/^wss?:\/\//i.test(url)) url = "ws://" + url;
+  return url + "/attach";
+}
+function toHttpBase(base) {
+  let url = base.trim().replace(/\/+$/, "");
+  if (/^wss:\/\//i.test(url)) url = "https://" + url.slice("wss://".length);
+  else if (/^ws:\/\//i.test(url)) url = "http://" + url.slice("ws://".length);
+  else if (!/^https?:\/\//i.test(url)) url = "http://" + url;
+  return url;
+}
+var RemotePty = class {
+  constructor(opts) {
+    this.opts = opts;
+    this.cols = clampDim(opts.cols);
+    this.rows = clampDim(opts.rows);
+    this.sessionId = opts.sessionId ?? null;
+    document.addEventListener("visibilitychange", this.visibilityHandler);
+    void Promise.resolve().then(() => this.connect());
+  }
+  dataCbs = /* @__PURE__ */ new Set();
+  exitCbs = /* @__PURE__ */ new Set();
+  ws = null;
+  state = "connecting";
+  // Set on kill() (deliberate detach) or a real "exit" from the server —
+  // both mean "never reconnect again", but only one of them should ever
+  // also fire onExit (see handleExit / kill's comment).
+  stopped = false;
+  exited = false;
+  // True once this instance has completed at least one attach_ok. Governs
+  // whether the *next* attach sends last_seq at all — see sendAttach.
+  everAttached = false;
+  sessionId;
+  // Absolute byte offset into the session's stream that we've consumed up
+  // to. Seeded from attach_ok.seq (never assumed to start at 0 — see
+  // handleAttachOk for why), then incremented per live byte received.
+  lastSeq = 0;
+  // True for exactly the one binary message expected right after an
+  // attach_ok with truncated_history: true — see handleBinary.
+  expectClearSequence = false;
+  cols;
+  rows;
+  pendingWrites = [];
+  pendingWriteChars = 0;
+  reconnectAttempts = 0;
+  reconnectTimer = null;
+  // Set right before we close the socket ourselves to force an immediate,
+  // un-backed-off reconnect (see handleResyncRequired) — distinguishes that
+  // from a real transport failure in handleClose.
+  forcingImmediateReconnect = false;
+  heartbeatTimer = null;
+  awaitingPong = false;
+  // Bound once so it can be added and removed with the same reference.
+  visibilityHandler = () => this.handleVisibilityChange();
+  decoder = new TextDecoder("utf-8");
+  encoder = new TextEncoder();
+  // ── IPty ─────────────────────────────────────────────────────────────────
+  onData(cb) {
+    this.dataCbs.add(cb);
+    return { dispose: () => {
+      this.dataCbs.delete(cb);
+    } };
+  }
+  onExit(cb) {
+    this.exitCbs.add(cb);
+    return { dispose: () => {
+      this.exitCbs.delete(cb);
+    } };
+  }
+  resize(cols, rows) {
+    this.cols = clampDim(cols);
+    this.rows = clampDim(rows);
+    if (this.state === "live") this.sendJson({ t: "resize", cols: this.cols, rows: this.rows });
+  }
+  write(data) {
+    if (this.stopped) return;
+    if (this.state !== "live") {
+      this.queueWrite(data);
+      return;
+    }
+    this.sendBinary(this.encoder.encode(data));
+  }
+  // ────────────────────────────────────────────────────────────────────────
+  // CRITICAL: kill() MUST DETACH, NOT TERMINATE.
+  //
+  // This is IPty.kill(), and view.ts calls `this.pty?.kill()` from
+  // stopSession() — which runs on EVERY pane close AND EVERY backend switch,
+  // not just when the user actually wants the agent gone. For a remote
+  // session, "gone" would mean the daemon kills the shell/agent process on
+  // its side. That must NOT happen here: it would kill the user's long-lived
+  // agent every time they close this pane or switch the terminal's agent
+  // dropdown, which defeats the entire reason this backend exists (an agent
+  // that survives the local device going away).
+  //
+  // kill() therefore only closes OUR end of the WebSocket and stops trying
+  // to reconnect. The daemon's session keeps running; a future RemotePty
+  // (new pane, or reopening this one) can reattach to it via sessionId and
+  // pick up exactly where this left off.
+  //
+  // Ending the remote process for real is terminate() below: a separate,
+  // explicit method, never called from here, from onClose, from a backend
+  // switch, or from any other teardown path. If you're adding a call to it,
+  // it should be reachable only from something the user directly asked for.
+  // ────────────────────────────────────────────────────────────────────────
+  kill() {
+    this.stopped = true;
+    this.clearReconnectTimer();
+    this.clearHeartbeat();
+    document.removeEventListener("visibilitychange", this.visibilityHandler);
+    this.ws?.close();
+    this.ws = null;
+  }
+  // Explicit, user-initiated termination of the REMOTE process. Deliberately
+  // not part of IPty and not wired into any disposal path — see kill()'s
+  // comment above.
+  terminate() {
+    if (this.state === "live") this.sendJson({ t: "terminate" });
+  }
+  // ── connection lifecycle ─────────────────────────────────────────────────
+  connect() {
+    if (this.stopped) return;
+    this.state = "connecting";
+    this.emit(`\x1B[90m[remote] connecting to ${this.opts.url}\u2026\x1B[0m\r
+`);
+    let ws;
+    try {
+      ws = new WebSocket(toAttachUrl(this.opts.url));
+    } catch (err) {
+      this.emit(`\x1B[31m[remote] invalid daemon URL: ${String(err)}\x1B[0m\r
+`);
+      this.scheduleReconnect();
+      return;
+    }
+    ws.binaryType = "arraybuffer";
+    let settled = false;
+    const onDisconnect = () => {
+      if (settled) return;
+      settled = true;
+      this.handleClose();
+    };
+    ws.onopen = () => this.sendJson({ t: "hello", proto: PROTOCOL_VERSION, token: this.opts.token });
+    ws.onmessage = (ev) => this.handleMessage(ev);
+    ws.onclose = onDisconnect;
+    ws.onerror = onDisconnect;
+    this.ws = ws;
+  }
+  handleClose() {
+    this.ws = null;
+    this.clearHeartbeat();
+    if (this.stopped) return;
+    if (this.forcingImmediateReconnect) {
+      this.forcingImmediateReconnect = false;
+      this.state = "connecting";
+      this.connect();
+      return;
+    }
+    const wasLive = this.state === "live";
+    this.state = "connecting";
+    if (wasLive) {
+      this.emit("\x1B[33m[remote] connection lost, reconnecting\u2026\x1B[0m\r\n");
+    }
+    this.scheduleReconnect();
+  }
+  scheduleReconnect() {
+    if (this.stopped) return;
+    this.reconnectAttempts++;
+    if (this.reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+      this.emit(
+        `\x1B[31m[remote] gave up after ${MAX_RECONNECT_ATTEMPTS} attempts \u2014 reopen this terminal, or bring the app to the foreground, to retry.\x1B[0m\r
+`
+      );
+      return;
+    }
+    const backoff = Math.min(BASE_RECONNECT_DELAY_MS * 2 ** (this.reconnectAttempts - 1), MAX_RECONNECT_DELAY_MS);
+    const jittered = backoff + backoff * 0.3 * Math.random();
+    this.reconnectTimer = window.setTimeout(() => this.connect(), Math.round(jittered));
+  }
+  clearReconnectTimer() {
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+  // Bounded backoff (scheduleReconnect) answers "the network is flaky, retry
+  // patiently." Foregrounding answers a different question — "the device
+  // just wasn't running JS at all, so however long we waited is meaningless"
+  // — and needs a different trigger: the moment the app is usable again, not
+  // a fixed schedule computed before we knew it would be backgrounded. This
+  // fires for every visibility change (not just after giving up): even a
+  // still-in-budget wait is worth pre-empting once the user is actually
+  // looking at the screen again, since the alternative is just staring at a
+  // "reconnecting…" pane for whatever's left of a delay picked for a
+  // scenario (unattended retrying) that no longer applies.
+  handleVisibilityChange() {
+    if (document.visibilityState !== "visible") return;
+    if (this.stopped) return;
+    if (this.ws) return;
+    this.clearReconnectTimer();
+    this.reconnectAttempts = 0;
+    this.connect();
+  }
+  // ── protocol: hello / attach ─────────────────────────────────────────────
+  sendAttach() {
+    this.state = "attaching";
+    const msg = {
+      t: "attach",
+      backend: this.opts.backend,
+      cwd: this.opts.cwd,
+      cols: this.cols,
+      rows: this.rows
+    };
+    if (this.sessionId) msg.session_id = this.sessionId;
+    if (this.everAttached) msg.last_seq = this.lastSeq;
+    this.sendJson(msg);
+  }
+  handleAttachOk(msg) {
+    const sid = typeof msg.session_id === "string" ? msg.session_id : null;
+    if (sid && sid !== this.sessionId) {
+      this.sessionId = sid;
+      this.opts.onSessionId(sid);
+    }
+    this.lastSeq = typeof msg.seq === "number" ? msg.seq : 0;
+    this.expectClearSequence = msg.truncated_history === true;
+    const wasReconnect = this.everAttached;
+    this.everAttached = true;
+    this.reconnectAttempts = 0;
+    this.state = "live";
+    this.flushPendingWrites();
+    this.startHeartbeat();
+    if (wasReconnect) this.emit("\x1B[90m[remote] reconnected\x1B[0m\r\n");
+    if (msg.truncated_history) {
+      this.emit("\x1B[90m[remote] resumed with partial scrollback (older output was trimmed)\x1B[0m\r\n");
+    }
+  }
+  handleResyncRequired(msg) {
+    this.emit(`\x1B[33m[remote] can't resume exactly (${String(msg.reason)}) \u2014 reattaching fresh\x1B[0m\r
+`);
+    this.everAttached = false;
+    this.lastSeq = 0;
+    this.forcingImmediateReconnect = true;
+    this.ws?.close();
+  }
+  handleExit(msg) {
+    if (this.exited) return;
+    this.exited = true;
+    this.stopped = true;
+    this.clearReconnectTimer();
+    this.clearHeartbeat();
+    document.removeEventListener("visibilitychange", this.visibilityHandler);
+    const code = typeof msg.code === "number" ? msg.code : -1;
+    const signal = typeof msg.signal === "string" ? msg.signal : void 0;
+    for (const cb of this.exitCbs) cb({ exitCode: code, signal });
+    this.ws?.close();
+    this.ws = null;
+  }
+  handleError(msg) {
+    const code = typeof msg.code === "string" ? msg.code : "error";
+    const message = typeof msg.message === "string" ? msg.message : "";
+    if (this.state === "live") {
+      this.emit(`\x1B[33m[remote] ${code}: ${message}\x1B[0m\r
+`);
+      return;
+    }
+    if (code === "unknown_session" || code === "attach_mismatch") {
+      this.emit(`\x1B[33m[remote] ${message} \u2014 starting a new session\x1B[0m\r
+`);
+      this.sessionId = null;
+      this.sendAttach();
+      return;
+    }
+    this.emit(`\x1B[31m[remote] ${code}: ${message}\x1B[0m\r
+`);
+    this.stopped = true;
+    this.ws?.close();
+  }
+  // ── protocol: message dispatch ───────────────────────────────────────────
+  handleMessage(ev) {
+    if (typeof ev.data === "string") this.handleControl(ev.data);
+    else this.handleBinary(ev.data);
+  }
+  handleControl(raw) {
+    let msg;
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    switch (msg.t) {
+      case "hello_ok":
+        this.sendAttach();
+        break;
+      case "attach_ok":
+        this.handleAttachOk(msg);
+        break;
+      case "resync_required":
+        this.handleResyncRequired(msg);
+        break;
+      case "exit":
+        this.handleExit(msg);
+        break;
+      case "error":
+        this.handleError(msg);
+        break;
+      // Application-level heartbeat: browsers can't send (or originate)
+      // WebSocket-level ping frames, so liveness is checked with these
+      // JSON messages in both directions — reply to the server's, and see
+      // startHeartbeat for us sending our own.
+      case "ping":
+        this.sendJson({ t: "pong", ts: msg.ts });
+        break;
+      case "pong":
+        this.awaitingPong = false;
+        break;
+      default:
+        break;
+    }
+  }
+  handleBinary(buf) {
+    const bytes = new Uint8Array(buf);
+    if (this.expectClearSequence) {
+      this.expectClearSequence = false;
+      this.emit(this.decoder.decode(bytes, { stream: true }));
+      return;
+    }
+    this.lastSeq += bytes.length;
+    const text = this.decoder.decode(bytes, { stream: true });
+    if (text) this.emit(text);
+  }
+  // ── heartbeat ────────────────────────────────────────────────────────────
+  startHeartbeat() {
+    this.clearHeartbeat();
+    this.heartbeatTimer = window.setInterval(() => {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      if (this.awaitingPong) {
+        this.ws.close();
+        return;
+      }
+      this.sendJson({ t: "ping", ts: Date.now() });
+      this.awaitingPong = true;
+    }, HEARTBEAT_INTERVAL_MS);
+  }
+  clearHeartbeat() {
+    if (this.heartbeatTimer !== null) {
+      window.clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    this.awaitingPong = false;
+  }
+  // ── outgoing data ────────────────────────────────────────────────────────
+  sendJson(obj) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(obj));
+  }
+  sendBinary(bytes) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(bytes);
+  }
+  queueWrite(data) {
+    this.pendingWrites.push(data);
+    this.pendingWriteChars += data.length;
+    while (this.pendingWriteChars > MAX_PENDING_WRITE_CHARS && this.pendingWrites.length > 1) {
+      const dropped = this.pendingWrites.shift();
+      if (dropped) this.pendingWriteChars -= dropped.length;
+    }
+  }
+  flushPendingWrites() {
+    if (!this.pendingWrites.length) return;
+    const combined = this.pendingWrites.join("");
+    this.pendingWrites = [];
+    this.pendingWriteChars = 0;
+    this.sendBinary(this.encoder.encode(combined));
+  }
+  emit(s) {
+    if (s) for (const cb of this.dataCbs) cb(s);
+  }
+};
+async function fetchRemoteInfo(url, token) {
+  const res = await (0, import_obsidian.requestUrl)({
+    url: `${toHttpBase(url)}/info`,
+    headers: { Authorization: `Bearer ${token}` },
+    throw: false
+  });
+  if (res.status !== 200) {
+    throw new Error(`daemon returned ${res.status}: ${res.text || "no body"}`);
+  }
+  const body = res.json;
+  return {
+    protocolVersion: body.protocol_version,
+    backends: body.backends,
+    maxSessions: body.max_sessions,
+    sessionCreateRatePerMin: body.session_create_rate_per_min
+  };
+}
+
 // src/settings.ts
 var AGENT_BACKENDS = [
   { id: "claude", label: "Claude Code", requiresCli: true, cliName: "claude", installUrl: "https://claude.com/product/claude-code" },
@@ -10331,26 +10737,35 @@ var AGENT_BACKENDS = [
   { id: "codex", label: "Codex", requiresCli: true, cliName: "codex", installUrl: "https://learn.chatgpt.com/docs/codex/cli" },
   { id: "antigravity", label: "Antigravity", requiresCli: true, cliName: "agy", installUrl: "https://antigravity.google/docs/cli/install/" },
   // A plain interactive shell with no agent, so you can run other commands.
-  { id: "terminal", label: "Terminal", requiresCli: false, cliName: "", installUrl: "" }
+  { id: "terminal", label: "Terminal", requiresCli: false, cliName: "", installUrl: "" },
+  // Connects to a remote agent-ptyd.py daemon instead of spawning a local
+  // process — see RemoteSettings. Never gated on CLI availability (there's
+  // nothing local to probe); RemotePty reports its own connection status.
+  { id: "remote", label: "Remote", requiresCli: false, cliName: "", installUrl: "" }
 ];
 var DEFAULT_SETTINGS = {
   terminal: {
     backend: "claude",
-    enabledBackends: { claude: true, ollama: true, codex: true, antigravity: true, terminal: true },
+    enabledBackends: { claude: true, ollama: true, codex: true, antigravity: true, terminal: true, remote: true },
     ollamaModel: "",
     pythonPath: "",
     shell: "",
     shellArgs: "",
     startupCommand: "",
     cwd: "vault",
-    fontSize: 13
+    fontSize: 13,
+    remote: { enabled: false, url: "", token: "", cwd: "", backend: "", sessionId: "" }
   }
 };
-var AgentMCPSettingsTab = class extends import_obsidian.PluginSettingTab {
+var AgentMCPSettingsTab = class extends import_obsidian2.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
   }
+  // Ephemeral UI state (not persisted): the last successful GET /info
+  // result, so the backend dropdown has options to show. Cleared on reload;
+  // re-fetched on demand via the "Fetch backends" button.
+  remoteBackendsCache = null;
   // Opt in to Obsidian 1.13+'s declarative settings API. This tab renders
   // imperatively in display() below — much of it is dynamic (per-agent toggles,
   // live availability badges) and has no static declarative form — so there are
@@ -10362,11 +10777,11 @@ var AgentMCPSettingsTab = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    new import_obsidian.Setting(containerEl).setName("Agents").setHeading();
+    new import_obsidian2.Setting(containerEl).setName("Agents").setHeading();
     this.renderAgentToggles(containerEl);
     const t = this.plugin.settings.terminal;
     const selectable = AGENT_BACKENDS.filter((b) => b.id === t.backend || t.enabledBackends[b.id]);
-    new import_obsidian.Setting(containerEl).setName("Default agent").setDesc(
+    new import_obsidian2.Setting(containerEl).setName("Default agent").setDesc(
       'Which agent a new terminal launches with. You can also switch agents from the dropdown at the top of the terminal \u2014 switching there restarts the session and updates this default. "Ollama" runs `ollama launch claude`, which points Claude Code at a local Ollama model \u2014 the IDE connection, MCP tools, and diff previews all work identically.'
     ).addDropdown((drop) => {
       for (const { id, label } of selectable) drop.addOption(id, label);
@@ -10377,7 +10792,7 @@ var AgentMCPSettingsTab = class extends import_obsidian.PluginSettingTab {
       });
     });
     if (this.plugin.settings.terminal.backend === "ollama") {
-      new import_obsidian.Setting(containerEl).setName("Ollama model").setDesc(
+      new import_obsidian2.Setting(containerEl).setName("Ollama model").setDesc(
         "Passed as `ollama launch claude --model <model>` (e.g. qwen3.5, glm-4.7-flash, kimi-k2.5:cloud). Leave blank to use Ollama's default. Requires a recent Ollama with the `launch` command and a model with a large (64k+) context window."
       ).addText(
         (text) => text.setPlaceholder("qwen3.5").setValue(this.plugin.settings.terminal.ollamaModel).onChange(async (value) => {
@@ -10386,37 +10801,39 @@ var AgentMCPSettingsTab = class extends import_obsidian.PluginSettingTab {
         })
       );
     }
-    new import_obsidian.Setting(containerEl).setName("Terminal").setHeading();
-    new import_obsidian.Setting(containerEl).setName("Python path").setDesc(
-      'Path to a Python 3 interpreter. The terminal uses it to run a small pseudo-terminal bridge (standard library only, no packages to install). Leave blank to use "python3" from your PATH. Required on macOS and Linux; Windows is not yet supported.'
-    ).addText(
-      (text) => text.setPlaceholder("python3").setValue(this.plugin.settings.terminal.pythonPath).onChange(async (value) => {
-        this.plugin.settings.terminal.pythonPath = value.trim();
-        await this.plugin.saveSettings();
-      })
-    ).addButton(
-      (button) => button.setButtonText("Check").onClick(async () => {
-        button.setButtonText("Checking\u2026").setDisabled(true);
-        const result = await checkPython(this.plugin.settings.terminal.pythonPath);
-        new import_obsidian.Notice(result.message, result.ok ? 5e3 : 1e4);
-        button.setButtonText("Check").setDisabled(false);
-      })
-    );
-    new import_obsidian.Setting(containerEl).setName("Shell").setDesc(
-      "Path to the shell executable. Leave blank to use $SHELL (macOS/Linux) or %COMSPEC% (Windows)."
-    ).addText(
-      (text) => text.setPlaceholder(process2.env.SHELL || "/bin/zsh").setValue(this.plugin.settings.terminal.shell).onChange(async (value) => {
-        this.plugin.settings.terminal.shell = value.trim();
-        await this.plugin.saveSettings();
-      })
-    );
-    new import_obsidian.Setting(containerEl).setName("Shell arguments").setDesc("Space-separated arguments passed to the shell on launch.").addText(
-      (text) => text.setPlaceholder("-l").setValue(this.plugin.settings.terminal.shellArgs).onChange(async (value) => {
-        this.plugin.settings.terminal.shellArgs = value;
-        await this.plugin.saveSettings();
-      })
-    );
-    new import_obsidian.Setting(containerEl).setName("Startup command").setDesc(
+    new import_obsidian2.Setting(containerEl).setName("Terminal").setHeading();
+    if (!import_obsidian2.Platform.isMobile) {
+      new import_obsidian2.Setting(containerEl).setName("Python path").setDesc(
+        'Path to a Python 3 interpreter. The terminal uses it to run a small pseudo-terminal bridge (standard library only, no packages to install). Leave blank to use "python3" from your PATH. Required on macOS and Linux; Windows is not yet supported.'
+      ).addText(
+        (text) => text.setPlaceholder("python3").setValue(this.plugin.settings.terminal.pythonPath).onChange(async (value) => {
+          this.plugin.settings.terminal.pythonPath = value.trim();
+          await this.plugin.saveSettings();
+        })
+      ).addButton(
+        (button) => button.setButtonText("Check").onClick(async () => {
+          button.setButtonText("Checking\u2026").setDisabled(true);
+          const result = await checkPython(this.plugin.settings.terminal.pythonPath);
+          new import_obsidian2.Notice(result.message, result.ok ? 5e3 : 1e4);
+          button.setButtonText("Check").setDisabled(false);
+        })
+      );
+      new import_obsidian2.Setting(containerEl).setName("Shell").setDesc(
+        "Path to the shell executable. Leave blank to use $SHELL (macOS/Linux) or %COMSPEC% (Windows)."
+      ).addText(
+        (text) => text.setPlaceholder(process2.env.SHELL || "/bin/zsh").setValue(this.plugin.settings.terminal.shell).onChange(async (value) => {
+          this.plugin.settings.terminal.shell = value.trim();
+          await this.plugin.saveSettings();
+        })
+      );
+      new import_obsidian2.Setting(containerEl).setName("Shell arguments").setDesc("Space-separated arguments passed to the shell on launch.").addText(
+        (text) => text.setPlaceholder("-l").setValue(this.plugin.settings.terminal.shellArgs).onChange(async (value) => {
+          this.plugin.settings.terminal.shellArgs = value;
+          await this.plugin.saveSettings();
+        })
+      );
+    }
+    new import_obsidian2.Setting(containerEl).setName("Startup command").setDesc(
       "Overrides the command the Claude Code agent launches with. Leave blank to run `claude`. Ignored when the Ollama agent is selected."
     ).addText(
       (text) => text.setPlaceholder("claude").setValue(this.plugin.settings.terminal.startupCommand).onChange(async (value) => {
@@ -10424,16 +10841,97 @@ var AgentMCPSettingsTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Working directory").setDesc("Where each new terminal starts.").addDropdown(
+    new import_obsidian2.Setting(containerEl).setName("Working directory").setDesc("Where each new terminal starts.").addDropdown(
       (drop) => drop.addOption("vault", "Vault root").addOption("home", "Home directory").setValue(this.plugin.settings.terminal.cwd).onChange(async (value) => {
         this.plugin.settings.terminal.cwd = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Font size").setDesc("Font size used inside the terminal.").addSlider(
+    new import_obsidian2.Setting(containerEl).setName("Font size").setDesc("Font size used inside the terminal.").addSlider(
       (slider) => slider.setLimits(10, 22, 1).setValue(this.plugin.settings.terminal.fontSize).setDynamicTooltip().onChange(async (value) => {
         this.plugin.settings.terminal.fontSize = value;
         await this.plugin.saveSettings();
+      })
+    );
+    this.renderRemoteSection(containerEl);
+  }
+  // A standalone agent-ptyd.py daemon (server/agent-ptyd.py), reached over a
+  // WebSocket instead of spawning a local shell — see terminal/remote.ts.
+  // Unlike the rest of this tab, this section renders on both platforms: on
+  // mobile it's the only way to configure anything (see the Terminal section
+  // above, which hides itself there).
+  renderRemoteSection(containerEl) {
+    new import_obsidian2.Setting(containerEl).setName("Remote").setHeading();
+    const r = this.plugin.settings.terminal.remote;
+    new import_obsidian2.Setting(containerEl).setName("Enable remote backend").setDesc(
+      `Connects to a standalone agent-ptyd.py daemon instead of spawning a local shell, so a long-lived agent session survives closing this pane or this device. Also needs "Remote" enabled above to appear in the terminal's agent switcher.`
+    ).addToggle(
+      (toggle) => toggle.setValue(r.enabled).onChange(async (value) => {
+        r.enabled = value;
+        await this.plugin.saveSettings();
+        this.display();
+      })
+    );
+    if (!r.enabled) return;
+    new import_obsidian2.Setting(containerEl).setName("Daemon URL").setDesc("Where agent-ptyd.py is listening, e.g. ws://127.0.0.1:8765 (or a tailnet/tunnel URL).").addText(
+      (text) => text.setPlaceholder("ws://127.0.0.1:8765").setValue(r.url).onChange(async (value) => {
+        r.url = value.trim();
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Auth token").setDesc("The token agent-ptyd.py printed on first run (also saved in its own config file).").addText((text) => {
+      text.inputEl.type = "password";
+      text.setValue(r.token).onChange(async (value) => {
+        r.token = value.trim();
+        await this.plugin.saveSettings();
+      });
+    });
+    new import_obsidian2.Setting(containerEl).setName("Remote project path").setDesc(
+      "Relative to the DAEMON's own configured root \u2014 not a path on this machine. This vault's location here and the project's location on the daemon's host are unrelated, so this mapping is never guessed. Leave blank to use the daemon's root itself."
+    ).addText(
+      (text) => text.setPlaceholder("(daemon root)").setValue(r.cwd).onChange(async (value) => {
+        r.cwd = value.trim();
+        await this.plugin.saveSettings();
+      })
+    );
+    this.renderRemoteBackendPicker(containerEl, r);
+  }
+  // Populates its dropdown from the daemon's own GET /info rather than
+  // assuming the local AGENT_BACKENDS list applies — the daemon's backend
+  // ids/labels are whatever its operator configured, and guessing wrong is
+  // only discovered at attach time otherwise.
+  renderRemoteBackendPicker(containerEl, r) {
+    const setting = new import_obsidian2.Setting(containerEl).setName("Remote backend").setDesc(
+      this.remoteBackendsCache ? "Which of the daemon's configured backends to run." : "Fetch the daemon's available backends to choose one."
+    );
+    if (this.remoteBackendsCache && this.remoteBackendsCache.length) {
+      const cache = this.remoteBackendsCache;
+      setting.addDropdown((drop) => {
+        for (const { id, label } of cache) drop.addOption(id, label);
+        if (r.backend && !cache.some((b) => b.id === r.backend)) {
+          drop.addOption(r.backend, `${r.backend} (not in daemon's list)`);
+        }
+        drop.setValue(r.backend).onChange(async (value) => {
+          r.backend = value;
+          await this.plugin.saveSettings();
+        });
+      });
+    }
+    setting.addButton(
+      (button) => button.setButtonText("Fetch backends").onClick(async () => {
+        button.setButtonText("Fetching\u2026").setDisabled(true);
+        try {
+          const info = await fetchRemoteInfo(r.url, r.token);
+          this.remoteBackendsCache = info.backends;
+          if (!r.backend && info.backends.length) {
+            r.backend = info.backends[0].id;
+          }
+          await this.plugin.saveSettings();
+          new import_obsidian2.Notice(`Found ${info.backends.length} backend(s) on the daemon.`);
+        } catch (err) {
+          new import_obsidian2.Notice(`Could not reach the daemon: ${String(err)}`, 1e4);
+        }
+        this.display();
       })
     );
   }
@@ -10443,7 +10941,7 @@ var AgentMCPSettingsTab = class extends import_obsidian.PluginSettingTab {
   async setBackendEnabled(id, value, toggle) {
     const enabled = this.plugin.settings.terminal.enabledBackends;
     if (!value && Object.values({ ...enabled, [id]: false }).every((v) => !v)) {
-      new import_obsidian.Notice("Keep at least one agent enabled.");
+      new import_obsidian2.Notice("Keep at least one agent enabled.");
       toggle.setValue(true);
       return;
     }
@@ -10459,10 +10957,12 @@ var AgentMCPSettingsTab = class extends import_obsidian.PluginSettingTab {
   renderAgentToggles(containerEl) {
     const pending = [];
     for (const meta of AGENT_BACKENDS) {
-      const setting = new import_obsidian.Setting(containerEl).setName(meta.label);
+      const setting = new import_obsidian2.Setting(containerEl).setName(meta.label);
       const enabled = this.plugin.settings.terminal.enabledBackends[meta.id];
       if (!meta.requiresCli) {
-        setting.setDesc("A plain interactive shell \u2014 always available when enabled.");
+        setting.setDesc(
+          meta.id === "remote" ? "Connects to a remote agent-ptyd.py daemon \u2014 configure the connection below." : "A plain interactive shell \u2014 always available when enabled."
+        );
         setting.addToggle(
           (toggle) => toggle.setValue(enabled).onChange((value) => void this.setBackendEnabled(meta.id, value, toggle))
         );
@@ -10513,6 +11013,10 @@ function probeCli(cliName, shell) {
     });
   });
 }
+function probeMobile(backend, remote) {
+  if (backend !== "remote" || !remote) return Promise.resolve(false);
+  return fetchRemoteInfo(remote.url, remote.token).then((info) => info.backends.length > 0).catch(() => false);
+}
 var BackendAvailability = class {
   cache = /* @__PURE__ */ new Map();
   inflight = /* @__PURE__ */ new Map();
@@ -10523,14 +11027,7 @@ var BackendAvailability = class {
   // Probe once if the result isn't already known; return the cached result
   // otherwise. Concurrent calls for the same backend await the same probe.
   ensure(backend, cliName, shell) {
-    const cached = this.cache.get(backend);
-    if (cached === "available" || cached === "missing") return Promise.resolve(cached);
-    const existing = this.inflight.get(backend);
-    if (existing) return existing;
-    this.cache.set(backend, "checking");
-    const p = probeCli(cliName, shell).then((ok) => this.settle(backend, ok)).catch(() => this.settle(backend, false));
-    this.inflight.set(backend, p);
-    return p;
+    return this.run(backend, () => probeCli(cliName, shell));
   }
   // Force a fresh probe, discarding any cached result. Used after the user
   // installs a CLI and asks to recheck.
@@ -10538,6 +11035,28 @@ var BackendAvailability = class {
     this.cache.delete(backend);
     this.inflight.delete(backend);
     return this.ensure(backend, cliName, shell);
+  }
+  // Mobile counterparts of ensure/recheck (see probeMobile above) — kept as
+  // separate methods rather than a branch inside ensure()/recheck() so
+  // desktop's probing path is untouched byte-for-byte, per the "no Node
+  // imports on any mobile path" requirement this was split out for.
+  ensureMobile(backend, remote) {
+    return this.run(backend, () => probeMobile(backend, remote));
+  }
+  recheckMobile(backend, remote) {
+    this.cache.delete(backend);
+    this.inflight.delete(backend);
+    return this.ensureMobile(backend, remote);
+  }
+  run(backend, probe) {
+    const cached = this.cache.get(backend);
+    if (cached === "available" || cached === "missing") return Promise.resolve(cached);
+    const existing = this.inflight.get(backend);
+    if (existing) return existing;
+    this.cache.set(backend, "checking");
+    const p = probe().then((ok) => this.settle(backend, ok)).catch(() => this.settle(backend, false));
+    this.inflight.set(backend, p);
+    return p;
   }
   settle(backend, ok) {
     const state = ok ? "available" : "missing";
@@ -10548,7 +11067,7 @@ var BackendAvailability = class {
 };
 
 // src/tools/editor.ts
-var import_obsidian2 = require("obsidian");
+var import_obsidian3 = require("obsidian");
 
 // src/tools/types.ts
 function wrap(data) {
@@ -10558,10 +11077,10 @@ function wrap(data) {
 // src/tools/editor.ts
 function getVaultBasePath(app) {
   const adapter = app.vault.adapter;
-  return adapter instanceof import_obsidian2.FileSystemAdapter ? adapter.getBasePath() : "";
+  return adapter instanceof import_obsidian3.FileSystemAdapter ? adapter.getBasePath() : "";
 }
 function getSelectionData(app) {
-  const view = app.workspace.getActiveViewOfType(import_obsidian2.MarkdownView);
+  const view = app.workspace.getActiveViewOfType(import_obsidian3.MarkdownView);
   if (!view?.file) return null;
   const editor = view.editor;
   const basePath = getVaultBasePath(app);
@@ -10603,7 +11122,7 @@ function createEditorTools(app, getLatestSelection) {
       call() {
         const base = basePath();
         const leaves = app.workspace.getLeavesOfType("markdown");
-        const active = app.workspace.getActiveViewOfType(import_obsidian2.MarkdownView);
+        const active = app.workspace.getActiveViewOfType(import_obsidian3.MarkdownView);
         return wrap({
           tabs: leaves.filter((l) => l.view.file).map((l) => {
             const file = l.view.file;
@@ -10629,7 +11148,7 @@ function createEditorTools(app, getLatestSelection) {
 }
 
 // src/terminal/view.ts
-var import_obsidian3 = require("obsidian");
+var import_obsidian4 = require("obsidian");
 var import_xterm = __toESM(require_xterm());
 var import_addon_fit = __toESM(require_addon_fit());
 var import_addon_web_links = __toESM(require_addon_web_links());
@@ -10637,7 +11156,7 @@ var import_addon_unicode11 = __toESM(require_addon_unicode11());
 var import_addon_canvas = __toESM(require_addon_canvas());
 var AGENT_TERMINAL_VIEW_TYPE = "agent-terminal";
 var RESIZE_DEBOUNCE_MS = 60;
-var AgentTerminalView = class extends import_obsidian3.ItemView {
+var AgentTerminalView = class extends import_obsidian4.ItemView {
   constructor(leaf, configProvider) {
     super(leaf);
     this.configProvider = configProvider;
@@ -10673,8 +11192,9 @@ var AgentTerminalView = class extends import_obsidian3.ItemView {
     container.empty();
     container.addClass("agent-mcp-terminal-container");
     this.cfg = this.configProvider();
-    this.currentBackend = this.cfg.backend;
+    this.currentBackend = import_obsidian4.Platform.isMobile ? "remote" : this.cfg.backend;
     this.buildToolbar(container);
+    if (import_obsidian4.Platform.isMobile) this.buildMobileKeyBar(container);
     this.host = container.createDiv({ cls: "agent-mcp-terminal-host" });
     void this.startSession();
   }
@@ -10697,8 +11217,34 @@ var AgentTerminalView = class extends import_obsidian3.ItemView {
       cls: "clickable-icon agent-mcp-terminal-settings-btn",
       attr: { "aria-label": "Open plugin settings" }
     });
-    (0, import_obsidian3.setIcon)(settingsBtn, "settings");
+    (0, import_obsidian4.setIcon)(settingsBtn, "settings");
     this.registerDomEvent(settingsBtn, "click", () => this.cfg?.openSettings());
+  }
+  // A small accessory row of keys mobile soft keyboards don't have. Esc is
+  // first and most important: it's how Claude Code interrupts an agent
+  // mid-response, making it the most-used non-alphanumeric key while
+  // prompting, and there is no way to type it on a phone otherwise. Tab and
+  // the arrow keys cover the rest of what a soft keyboard omits. Deliberately
+  // NOT a full modifier system (no Ctrl/Alt) — Esc is what makes this usable
+  // at all; the rest can follow later if it's needed.
+  buildMobileKeyBar(container) {
+    const bar = container.createDiv({ cls: "agent-mcp-terminal-keybar" });
+    const keys = [
+      { label: "Esc", seq: "\x1B" },
+      { label: "Tab", seq: "	" },
+      { label: "\u2191", seq: "\x1B[A" },
+      { label: "\u2193", seq: "\x1B[B" },
+      { label: "\u2190", seq: "\x1B[D" },
+      { label: "\u2192", seq: "\x1B[C" }
+    ];
+    for (const { label, seq } of keys) {
+      const btn = bar.createEl("button", { cls: "agent-mcp-terminal-keybar-btn", text: label });
+      this.registerDomEvent(btn, "touchstart", (e) => {
+        e.preventDefault();
+        this.pty?.write(seq);
+        this.term?.focus();
+      });
+    }
   }
   // Rebuilds the switcher options from the current enabled/available agent list,
   // always including the running agent so the control reflects the live session.
@@ -10752,6 +11298,10 @@ var AgentTerminalView = class extends import_obsidian3.ItemView {
         return;
       }
     }
+    if (backend === "remote" && !cfg.remote) {
+      this.renderRemoteNotConfiguredPanel(host);
+      return;
+    }
     const command = cfg.resolveStartupCommand(backend);
     const term = new import_xterm.Terminal({
       fontFamily: cfg.fontFamily || 'Menlo, Consolas, "Liberation Mono", monospace',
@@ -10772,6 +11322,9 @@ var AgentTerminalView = class extends import_obsidian3.ItemView {
     term.loadAddon(unicode11);
     term.unicode.activeVersion = "11";
     term.open(host);
+    if (import_obsidian4.Platform.isMobile) {
+      this.registerDomEvent(host, "touchend", () => term.focus());
+    }
     try {
       term.loadAddon(new import_addon_canvas.CanvasAddon());
     } catch {
@@ -10780,7 +11333,7 @@ var AgentTerminalView = class extends import_obsidian3.ItemView {
     this.fit = fit;
     this.scheduleInitialFit(host);
     try {
-      this.pty = this.startPty(cfg, command, term.cols, term.rows);
+      this.pty = backend === "remote" && cfg.remote ? this.startRemotePty(cfg.remote, term.cols, term.rows) : this.startPty(cfg, command, term.cols, term.rows);
     } catch (err) {
       const e = err;
       term.writeln("\x1B[31mFailed to start shell:\x1B[0m " + (e.message ?? String(err)));
@@ -10795,6 +11348,21 @@ var AgentTerminalView = class extends import_obsidian3.ItemView {
   renderInfoPanel(host, message) {
     const panel = host.createDiv({ cls: "agent-mcp-terminal-message" });
     panel.createDiv({ cls: "agent-mcp-terminal-message-body", text: message });
+  }
+  // Shown when "Remote" is selected but main.ts didn't supply cfg.remote —
+  // i.e. it isn't fully configured yet (enabled + URL + token + backend all
+  // set). Mirrors renderMissingPanel's shape for a CLI agent: no attempt to
+  // connect, just where to go fix it.
+  renderRemoteNotConfiguredPanel(host) {
+    const panel = host.createDiv({ cls: "agent-mcp-terminal-message" });
+    panel.createDiv({ cls: "agent-mcp-terminal-message-title", text: "Remote backend not configured" });
+    panel.createDiv({
+      cls: "agent-mcp-terminal-message-body",
+      text: "Set a daemon URL, auth token, and remote backend in the plugin settings."
+    });
+    const actions = panel.createDiv({ cls: "agent-mcp-terminal-message-actions" });
+    const settings = actions.createEl("button", { text: "Open settings" });
+    this.registerDomEvent(settings, "click", () => this.cfg?.openSettings());
   }
   // Shown instead of launching a CLI-backed agent whose tool isn't installed. No
   // shell, no install directories (those change and add maintenance) — just which
@@ -10881,6 +11449,23 @@ var AgentTerminalView = class extends import_obsidian3.ItemView {
       rows: Math.max(rows, 2)
     });
   }
+  // Builds a RemotePty (see remote.ts) instead of spawning a local shell.
+  // Synchronous like startPty(), even though the actual connection happens
+  // asynchronously inside RemotePty — it reports its own "connecting…" and
+  // any errors through onData once wirePtyToTerm subscribes, right after
+  // this returns.
+  startRemotePty(remote, cols, rows) {
+    return new RemotePty({
+      url: remote.url,
+      token: remote.token,
+      backend: remote.backend,
+      cwd: remote.cwd,
+      cols: Math.max(cols, 2),
+      rows: Math.max(rows, 2),
+      sessionId: remote.sessionId ?? void 0,
+      onSessionId: remote.onSessionId
+    });
+  }
   wirePtyToTerm(pty, term) {
     this.disposers.push(
       pty.onData((data) => term.write(data)),
@@ -10938,7 +11523,7 @@ function readTheme() {
 }
 
 // src/diff/view.ts
-var import_obsidian4 = require("obsidian");
+var import_obsidian5 = require("obsidian");
 var AGENT_DIFF_VIEW_TYPE = "agent-diff";
 function diffLines(oldStr, newStr) {
   const a = oldStr.length ? oldStr.split("\n") : [];
@@ -10977,7 +11562,7 @@ function diffLines(oldStr, newStr) {
   }
   return rows;
 }
-var AgentDiffView = class extends import_obsidian4.ItemView {
+var AgentDiffView = class extends import_obsidian5.ItemView {
   payload = null;
   constructor(leaf) {
     super(leaf);
@@ -11115,7 +11700,7 @@ function makeFrame(opcode, data) {
 function asString(v) {
   return typeof v === "string" ? v : "";
 }
-var ObsidianAgentMCP = class extends import_obsidian5.Plugin {
+var ObsidianAgentMCP = class extends import_obsidian6.Plugin {
   clients = /* @__PURE__ */ new Set();
   server = null;
   mcpServer = null;
@@ -11202,6 +11787,13 @@ var ObsidianAgentMCP = class extends import_obsidian5.Plugin {
         enabledBackends: {
           ...DEFAULT_SETTINGS.terminal.enabledBackends,
           ...data.terminal?.enabledBackends ?? {}
+        },
+        // Same reasoning: a config saved before `remote` existed must not
+        // leave e.g. `enabled` undefined and crash the "enabled && url && ..."
+        // check in remoteConfig() below.
+        remote: {
+          ...DEFAULT_SETTINGS.terminal.remote,
+          ...data.terminal?.remote ?? {}
         }
       }
     };
@@ -11223,6 +11815,7 @@ var ObsidianAgentMCP = class extends import_obsidian5.Plugin {
     for (const b of AGENT_BACKENDS) {
       if (b.requiresCli && t.enabledBackends[b.id]) void this.ensureBackendAvailability(b.id);
     }
+    if (import_obsidian6.Platform.isMobile) void this.ensureBackendAvailability("remote");
     return {
       pluginDir: this.pluginDir(),
       pythonPath: t.pythonPath,
@@ -11243,8 +11836,32 @@ var ObsidianAgentMCP = class extends import_obsidian5.Plugin {
       // on startup — reading the lock file for the auth token — exactly as it does
       // in an IDE-integrated terminal. Without it the user must run `/ide` and pick
       // Obsidian manually. Only set once the server is actually listening.
-      env: this.port ? { CLAUDE_CODE_SSE_PORT: String(this.port) } : void 0
+      env: this.port ? { CLAUDE_CODE_SSE_PORT: String(this.port) } : void 0,
+      remote: this.remoteConfig()
     };
+  }
+  // Only returns a config (and so only lets view.ts attempt a connection)
+  // once remote is actually enabled AND every field it needs is present —
+  // an incomplete configuration should show the "not configured" panel in
+  // view.ts, never a half-working connection attempt.
+  remoteConfig() {
+    const r = this.settings.terminal.remote;
+    if (!r.enabled || !r.url.trim() || !r.token.trim() || !r.backend.trim()) return void 0;
+    return {
+      url: r.url.trim(),
+      token: r.token.trim(),
+      cwd: r.cwd.trim(),
+      backend: r.backend.trim(),
+      sessionId: r.sessionId || null,
+      onSessionId: (id) => this.persistRemoteSessionId(id)
+    };
+  }
+  // Lets reopening a terminal for this project reattach instead of creating
+  // a new remote session — see RemoteSettings.sessionId in settings.ts.
+  persistRemoteSessionId(id) {
+    if (this.settings.terminal.remote.sessionId === id) return;
+    this.settings.terminal.remote.sessionId = id;
+    void this.saveSettings();
   }
   // The agent command that auto-runs when a terminal session starts, so the user
   // always lands in the agent rather than a bare shell. The Claude Code agent
@@ -11257,6 +11874,7 @@ var ObsidianAgentMCP = class extends import_obsidian5.Plugin {
   resolveStartupCommand(backend) {
     const t = this.settings.terminal;
     if (backend === "terminal") return "";
+    if (backend === "remote") return "";
     if (backend === "codex") return "codex";
     if (backend === "antigravity") return "agy";
     if (backend === "ollama") {
@@ -11283,8 +11901,18 @@ var ObsidianAgentMCP = class extends import_obsidian5.Plugin {
   // Agents shown in the in-terminal switcher: every agent the user has enabled,
   // whether or not its CLI is installed. Selecting an uninstalled one shows an
   // install prompt in the terminal instead of launching.
+  //
+  // On mobile only "remote" is filtered in: every other entry spawns a local
+  // process (a local pty, or a local CLI binary), which is simply impossible
+  // there — showing them in the switcher would let the user "select" an
+  // agent that silently does nothing it claims to do. view.ts additionally
+  // forces the running session to "remote" on mobile regardless of this list,
+  // but filtering here too keeps the dropdown itself from lying about what
+  // switching to another entry would actually run.
   enabledBackendList() {
-    return AGENT_BACKENDS.filter((b) => this.settings.terminal.enabledBackends[b.id]).map(({ id, label }) => ({ id, label }));
+    const enabled = AGENT_BACKENDS.filter((b) => this.settings.terminal.enabledBackends[b.id]);
+    const usable = import_obsidian6.Platform.isMobile ? enabled.filter((b) => b.id === "remote") : enabled;
+    return usable.map(({ id, label }) => ({ id, label }));
   }
   // The binary probed to decide availability. For Claude a custom startup command
   // overrides the default (we probe its first token). Non-CLI agents return null.
@@ -11303,17 +11931,30 @@ var ObsidianAgentMCP = class extends import_obsidian5.Plugin {
     return { shell: t.shell.trim() || void 0, shellArgs };
   }
   getBackendAvailability(backend) {
+    if (import_obsidian6.Platform.isMobile) {
+      return backend === "remote" ? this.availability.get(backend) : "missing";
+    }
     return this.resolveBackendCli(backend) ? this.availability.get(backend) : "available";
   }
   ensureBackendAvailability(backend) {
+    if (import_obsidian6.Platform.isMobile) return this.availability.ensureMobile(backend, this.mobileRemoteProbeTarget());
     const cli = this.resolveBackendCli(backend);
     if (!cli) return Promise.resolve("available");
     return this.availability.ensure(backend, cli, this.probeShell());
   }
   recheckBackendAvailability(backend) {
+    if (import_obsidian6.Platform.isMobile) return this.availability.recheckMobile(backend, this.mobileRemoteProbeTarget());
     const cli = this.resolveBackendCli(backend);
     if (!cli) return Promise.resolve("available");
     return this.availability.recheck(backend, cli, this.probeShell());
+  }
+  // The daemon endpoint to check "remote"'s mobile availability against —
+  // null (never available) until the connection is actually configured, so
+  // this never fires a request that could only fail.
+  mobileRemoteProbeTarget() {
+    const r = this.settings.terminal.remote;
+    if (!r.enabled || !r.url.trim() || !r.token.trim()) return null;
+    return { url: r.url.trim(), token: r.token.trim() };
   }
   // The in-terminal agent switcher persists its selection here so it becomes the
   // default the next time a terminal is opened.
@@ -11422,7 +12063,7 @@ data: ${JSON.stringify(msg)}
     const rel = this.toRelativePath(filePath);
     const fileName = rel.split("/").pop() || rel;
     const existing = this.app.vault.getAbstractFileByPath(rel);
-    const oldContent = existing instanceof import_obsidian5.TFile ? await this.app.vault.read(existing) : "";
+    const oldContent = existing instanceof import_obsidian6.TFile ? await this.app.vault.read(existing) : "";
     const returnLeaf = this.findMarkdownLeaf(rel);
     this.detachDiff(tabName);
     const leaf = this.app.workspace.getLeaf(true);

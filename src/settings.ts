@@ -1,12 +1,17 @@
-import { App, Notice, PluginSettingTab, Setting, ToggleComponent } from "obsidian";
+import { App, Notice, PluginSettingTab, Setting, ToggleComponent, Platform } from "obsidian";
 import type ObsidianAgentMCP from "./main";
 import { checkPython } from "./terminal/pty";
+import { fetchRemoteInfo, type RemoteBackendInfo } from "./terminal/remote";
 import type { Availability } from "./terminal/availability";
 import { process } from "./nodeApi";
 
 // Agents the terminal can launch. Adding an entry here surfaces it in both the
-// settings dropdown and the in-terminal toolbar switcher.
-export type AgentBackend = "claude" | "ollama" | "codex" | "antigravity" | "terminal";
+// settings dropdown and the in-terminal toolbar switcher. "remote" is special:
+// unlike the others it doesn't launch a local process at all — it connects to
+// a standalone agent-ptyd.py daemon (see terminal/remote.ts) and WHICH of the
+// daemon's own backends to run is a separate choice, configured below in
+// RemoteSettings, not one of these ids.
+export type AgentBackend = "claude" | "ollama" | "codex" | "antigravity" | "terminal" | "remote";
 
 export interface AgentBackendMeta {
   id: AgentBackend;
@@ -30,7 +35,34 @@ export const AGENT_BACKENDS: ReadonlyArray<AgentBackendMeta> = [
   { id: "antigravity", label: "Antigravity", requiresCli: true, cliName: "agy", installUrl: "https://antigravity.google/docs/cli/install/" },
   // A plain interactive shell with no agent, so you can run other commands.
   { id: "terminal", label: "Terminal", requiresCli: false, cliName: "", installUrl: "" },
+  // Connects to a remote agent-ptyd.py daemon instead of spawning a local
+  // process — see RemoteSettings. Never gated on CLI availability (there's
+  // nothing local to probe); RemotePty reports its own connection status.
+  { id: "remote", label: "Remote", requiresCli: false, cliName: "", installUrl: "" },
 ];
+
+export interface RemoteSettings {
+  // Separate from enabledBackends.remote (which only controls whether
+  // "Remote" appears in the switcher): this gates whether selecting it ever
+  // attempts a connection at all, vs. showing the "not configured" panel.
+  enabled: boolean;
+  // e.g. "ws://127.0.0.1:8765"; http(s):// and bare host:port also accepted.
+  url: string;
+  token: string;
+  // Relative to the DAEMON's own configured root — deliberately never
+  // derived from getVaultBasePath() or any other local path. The vault's
+  // location on this machine and the project's location on the daemon's
+  // host are unrelated; this mapping must be explicit. Blank = the
+  // daemon's root itself.
+  cwd: string;
+  // Which of the daemon's own backends (from GET /info) to attach as —
+  // populated by "Fetch backends" in the settings UI, not a fixed list.
+  backend: string;
+  // The opaque id the daemon returned for our session, persisted so
+  // reopening a terminal for this project reattaches instead of creating a
+  // new one. Empty until the first successful attach.
+  sessionId: string;
+}
 
 export interface TerminalSettings {
   backend: AgentBackend;
@@ -44,6 +76,7 @@ export interface TerminalSettings {
   startupCommand: string;
   cwd: "vault" | "home";
   fontSize: number;
+  remote: RemoteSettings;
 }
 
 export interface PluginSettings {
@@ -53,7 +86,7 @@ export interface PluginSettings {
 export const DEFAULT_SETTINGS: PluginSettings = {
   terminal: {
     backend: "claude",
-    enabledBackends: { claude: true, ollama: true, codex: true, antigravity: true, terminal: true },
+    enabledBackends: { claude: true, ollama: true, codex: true, antigravity: true, terminal: true, remote: true },
     ollamaModel: "",
     pythonPath: "",
     shell: "",
@@ -61,10 +94,16 @@ export const DEFAULT_SETTINGS: PluginSettings = {
     startupCommand: "",
     cwd: "vault",
     fontSize: 13,
+    remote: { enabled: false, url: "", token: "", cwd: "", backend: "", sessionId: "" },
   },
 };
 
 export class AgentMCPSettingsTab extends PluginSettingTab {
+  // Ephemeral UI state (not persisted): the last successful GET /info
+  // result, so the backend dropdown has options to show. Cleared on reload;
+  // re-fetched on demand via the "Fetch backends" button.
+  private remoteBackendsCache: RemoteBackendInfo[] | null = null;
+
   constructor(app: App, private plugin: ObsidianAgentMCP) {
     super(app, plugin);
   }
@@ -133,60 +172,69 @@ export class AgentMCPSettingsTab extends PluginSettingTab {
 
     new Setting(containerEl).setName("Terminal").setHeading();
 
-    new Setting(containerEl)
-      .setName("Python path")
-      .setDesc(
-        "Path to a Python 3 interpreter. The terminal uses it to run a small pseudo-terminal " +
-        "bridge (standard library only, no packages to install). Leave blank to use \"python3\" " +
-        "from your PATH. Required on macOS and Linux; Windows is not yet supported.",
-      )
-      .addText(text =>
-        text
-          .setPlaceholder("python3")
-          .setValue(this.plugin.settings.terminal.pythonPath)
-          .onChange(async value => {
-            this.plugin.settings.terminal.pythonPath = value.trim();
-            await this.plugin.saveSettings();
-          }),
-      )
-      .addButton(button =>
-        button
-          .setButtonText("Check")
-          .onClick(async () => {
-            button.setButtonText("Checking…").setDisabled(true);
-            const result = await checkPython(this.plugin.settings.terminal.pythonPath);
-            new Notice(result.message, result.ok ? 5000 : 10000);
-            button.setButtonText("Check").setDisabled(false);
-          }),
-      );
+    // Python path, Check, Shell, and Shell arguments all configure spawning a
+    // LOCAL process (spawnShell in pty.ts) — impossible on mobile (no Node
+    // child_process there at all), so they'd be dead controls at best. Check
+    // is worse than dead: it calls checkPython(), which throws attempting a
+    // Node child_process call that doesn't exist on mobile. Hide all four;
+    // the Remote section below is reachable regardless of platform and is
+    // the only way to configure anything on mobile.
+    if (!Platform.isMobile) {
+      new Setting(containerEl)
+        .setName("Python path")
+        .setDesc(
+          "Path to a Python 3 interpreter. The terminal uses it to run a small pseudo-terminal " +
+          "bridge (standard library only, no packages to install). Leave blank to use \"python3\" " +
+          "from your PATH. Required on macOS and Linux; Windows is not yet supported.",
+        )
+        .addText(text =>
+          text
+            .setPlaceholder("python3")
+            .setValue(this.plugin.settings.terminal.pythonPath)
+            .onChange(async value => {
+              this.plugin.settings.terminal.pythonPath = value.trim();
+              await this.plugin.saveSettings();
+            }),
+        )
+        .addButton(button =>
+          button
+            .setButtonText("Check")
+            .onClick(async () => {
+              button.setButtonText("Checking…").setDisabled(true);
+              const result = await checkPython(this.plugin.settings.terminal.pythonPath);
+              new Notice(result.message, result.ok ? 5000 : 10000);
+              button.setButtonText("Check").setDisabled(false);
+            }),
+        );
 
-    new Setting(containerEl)
-      .setName("Shell")
-      .setDesc(
-        "Path to the shell executable. Leave blank to use $SHELL (macOS/Linux) or %COMSPEC% (Windows).",
-      )
-      .addText(text =>
-        text
-          .setPlaceholder(process.env.SHELL || "/bin/zsh")
-          .setValue(this.plugin.settings.terminal.shell)
-          .onChange(async value => {
-            this.plugin.settings.terminal.shell = value.trim();
-            await this.plugin.saveSettings();
-          }),
-      );
+      new Setting(containerEl)
+        .setName("Shell")
+        .setDesc(
+          "Path to the shell executable. Leave blank to use $SHELL (macOS/Linux) or %COMSPEC% (Windows).",
+        )
+        .addText(text =>
+          text
+            .setPlaceholder(process.env.SHELL || "/bin/zsh")
+            .setValue(this.plugin.settings.terminal.shell)
+            .onChange(async value => {
+              this.plugin.settings.terminal.shell = value.trim();
+              await this.plugin.saveSettings();
+            }),
+        );
 
-    new Setting(containerEl)
-      .setName("Shell arguments")
-      .setDesc("Space-separated arguments passed to the shell on launch.")
-      .addText(text =>
-        text
-          .setPlaceholder("-l")
-          .setValue(this.plugin.settings.terminal.shellArgs)
-          .onChange(async value => {
-            this.plugin.settings.terminal.shellArgs = value;
-            await this.plugin.saveSettings();
-          }),
-      );
+      new Setting(containerEl)
+        .setName("Shell arguments")
+        .setDesc("Space-separated arguments passed to the shell on launch.")
+        .addText(text =>
+          text
+            .setPlaceholder("-l")
+            .setValue(this.plugin.settings.terminal.shellArgs)
+            .onChange(async value => {
+              this.plugin.settings.terminal.shellArgs = value;
+              await this.plugin.saveSettings();
+            }),
+        );
+    }
 
     new Setting(containerEl)
       .setName("Startup command")
@@ -231,6 +279,125 @@ export class AgentMCPSettingsTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
+
+    this.renderRemoteSection(containerEl);
+  }
+
+  // A standalone agent-ptyd.py daemon (server/agent-ptyd.py), reached over a
+  // WebSocket instead of spawning a local shell — see terminal/remote.ts.
+  // Unlike the rest of this tab, this section renders on both platforms: on
+  // mobile it's the only way to configure anything (see the Terminal section
+  // above, which hides itself there).
+  private renderRemoteSection(containerEl: HTMLElement): void {
+    new Setting(containerEl).setName("Remote").setHeading();
+
+    const r = this.plugin.settings.terminal.remote;
+
+    new Setting(containerEl)
+      .setName("Enable remote backend")
+      .setDesc(
+        "Connects to a standalone agent-ptyd.py daemon instead of spawning a local shell, so a " +
+        "long-lived agent session survives closing this pane or this device. Also needs \"Remote\" " +
+        "enabled above to appear in the terminal's agent switcher.",
+      )
+      .addToggle(toggle =>
+        toggle.setValue(r.enabled).onChange(async value => {
+          r.enabled = value;
+          await this.plugin.saveSettings();
+          this.display();
+        }),
+      );
+
+    if (!r.enabled) return;
+
+    new Setting(containerEl)
+      .setName("Daemon URL")
+      .setDesc("Where agent-ptyd.py is listening, e.g. ws://127.0.0.1:8765 (or a tailnet/tunnel URL).")
+      .addText(text =>
+        text
+          .setPlaceholder("ws://127.0.0.1:8765")
+          .setValue(r.url)
+          .onChange(async value => {
+            r.url = value.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Auth token")
+      .setDesc("The token agent-ptyd.py printed on first run (also saved in its own config file).")
+      .addText(text => {
+        text.inputEl.type = "password";
+        text.setValue(r.token).onChange(async value => {
+          r.token = value.trim();
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Remote project path")
+      .setDesc(
+        "Relative to the DAEMON's own configured root — not a path on this machine. This vault's " +
+        "location here and the project's location on the daemon's host are unrelated, so this " +
+        "mapping is never guessed. Leave blank to use the daemon's root itself.",
+      )
+      .addText(text =>
+        text
+          .setPlaceholder("(daemon root)")
+          .setValue(r.cwd)
+          .onChange(async value => {
+            r.cwd = value.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    this.renderRemoteBackendPicker(containerEl, r);
+  }
+
+  // Populates its dropdown from the daemon's own GET /info rather than
+  // assuming the local AGENT_BACKENDS list applies — the daemon's backend
+  // ids/labels are whatever its operator configured, and guessing wrong is
+  // only discovered at attach time otherwise.
+  private renderRemoteBackendPicker(containerEl: HTMLElement, r: RemoteSettings): void {
+    const setting = new Setting(containerEl)
+      .setName("Remote backend")
+      .setDesc(
+        this.remoteBackendsCache
+          ? "Which of the daemon's configured backends to run."
+          : "Fetch the daemon's available backends to choose one.",
+      );
+
+    if (this.remoteBackendsCache && this.remoteBackendsCache.length) {
+      const cache = this.remoteBackendsCache;
+      setting.addDropdown(drop => {
+        for (const { id, label } of cache) drop.addOption(id, label);
+        if (r.backend && !cache.some(b => b.id === r.backend)) {
+          drop.addOption(r.backend, `${r.backend} (not in daemon's list)`);
+        }
+        drop.setValue(r.backend).onChange(async value => {
+          r.backend = value;
+          await this.plugin.saveSettings();
+        });
+      });
+    }
+
+    setting.addButton(button =>
+      button.setButtonText("Fetch backends").onClick(async () => {
+        button.setButtonText("Fetching…").setDisabled(true);
+        try {
+          const info = await fetchRemoteInfo(r.url, r.token);
+          this.remoteBackendsCache = info.backends;
+          if (!r.backend && info.backends.length) {
+            r.backend = info.backends[0].id;
+          }
+          await this.plugin.saveSettings();
+          new Notice(`Found ${info.backends.length} backend(s) on the daemon.`);
+        } catch (err) {
+          new Notice(`Could not reach the daemon: ${String(err)}`, 10000);
+        }
+        this.display();
+      }),
+    );
   }
 
   // Persists an agent's enabled state, but refuses to disable the last one — an
@@ -262,9 +429,15 @@ export class AgentMCPSettingsTab extends PluginSettingTab {
       const enabled = this.plugin.settings.terminal.enabledBackends[meta.id];
 
       if (!meta.requiresCli) {
-        // The plain terminal is just a shell, so no availability probe — but it's
-        // still a real toggle you can hide from the switcher like any other agent.
-        setting.setDesc("A plain interactive shell — always available when enabled.");
+        // Neither the plain terminal nor the remote backend has a local CLI
+        // to probe — the terminal is just a shell (always available), and
+        // remote's actual availability depends on the connection details
+        // configured further down, which RemotePty itself reports on.
+        setting.setDesc(
+          meta.id === "remote"
+            ? "Connects to a remote agent-ptyd.py daemon — configure the connection below."
+            : "A plain interactive shell — always available when enabled.",
+        );
         setting.addToggle(toggle =>
           toggle
             .setValue(enabled)

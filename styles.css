@@ -175,6 +175,20 @@
 .agent-mcp-terminal-settings-btn {
   margin-left: auto;
 }
+.agent-mcp-terminal-keybar {
+  display: flex;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  flex: 0 0 auto;
+  overflow-x: auto;
+}
+.agent-mcp-terminal-keybar-btn {
+  flex: 0 0 auto;
+  padding: 4px 14px;
+  font-family: var(--font-monospace, monospace);
+  font-size: 13px;
+}
 .agent-mcp-terminal-host {
   width: 100%;
   flex: 1 1 auto;

@@ -1,4 +1,4 @@
-import { Plugin, WorkspaceLeaf, MarkdownView, TFile } from "obsidian";
+import { Plugin, WorkspaceLeaf, MarkdownView, TFile, Platform } from "obsidian";
 import {
   Buffer, process, createServer, randomUUID, createHash,
   writeFileSync, renameSync, unlinkSync, readdirSync, readFileSync, mkdirSync, existsSync,
@@ -208,6 +208,13 @@ export default class ObsidianAgentMCP extends Plugin {
           ...DEFAULT_SETTINGS.terminal.enabledBackends,
           ...(data.terminal?.enabledBackends ?? {}),
         },
+        // Same reasoning: a config saved before `remote` existed must not
+        // leave e.g. `enabled` undefined and crash the "enabled && url && ..."
+        // check in remoteConfig() below.
+        remote: {
+          ...DEFAULT_SETTINGS.terminal.remote,
+          ...(data.terminal?.remote ?? {}),
+        },
       },
     };
   }
@@ -240,6 +247,11 @@ export default class ObsidianAgentMCP extends Plugin {
     for (const b of AGENT_BACKENDS) {
       if (b.requiresCli && t.enabledBackends[b.id]) void this.ensureBackendAvailability(b.id);
     }
+    // On mobile "remote" is the only backend that can ever really run (see
+    // remoteConfig()/enabledBackendList() below), so it's the one worth
+    // warming there — the CLI backends above resolve to "missing" instantly
+    // without a probe (see ensureBackendAvailability's mobile branch).
+    if (Platform.isMobile) void this.ensureBackendAvailability("remote");
     return {
       pluginDir: this.pluginDir(),
       pythonPath: t.pythonPath,
@@ -261,7 +273,33 @@ export default class ObsidianAgentMCP extends Plugin {
       // in an IDE-integrated terminal. Without it the user must run `/ide` and pick
       // Obsidian manually. Only set once the server is actually listening.
       env: this.port ? { CLAUDE_CODE_SSE_PORT: String(this.port) } : undefined,
+      remote: this.remoteConfig(),
     };
+  }
+
+  // Only returns a config (and so only lets view.ts attempt a connection)
+  // once remote is actually enabled AND every field it needs is present —
+  // an incomplete configuration should show the "not configured" panel in
+  // view.ts, never a half-working connection attempt.
+  private remoteConfig(): TerminalConfig["remote"] {
+    const r = this.settings.terminal.remote;
+    if (!r.enabled || !r.url.trim() || !r.token.trim() || !r.backend.trim()) return undefined;
+    return {
+      url: r.url.trim(),
+      token: r.token.trim(),
+      cwd: r.cwd.trim(),
+      backend: r.backend.trim(),
+      sessionId: r.sessionId || null,
+      onSessionId: id => this.persistRemoteSessionId(id),
+    };
+  }
+
+  // Lets reopening a terminal for this project reattach instead of creating
+  // a new remote session — see RemoteSettings.sessionId in settings.ts.
+  private persistRemoteSessionId(id: string): void {
+    if (this.settings.terminal.remote.sessionId === id) return;
+    this.settings.terminal.remote.sessionId = id;
+    void this.saveSettings();
   }
 
   // The agent command that auto-runs when a terminal session starts, so the user
@@ -276,6 +314,11 @@ export default class ObsidianAgentMCP extends Plugin {
     const t = this.settings.terminal;
     // No agent: an empty command makes the view launch a plain interactive shell.
     if (backend === "terminal") return "";
+    // Unused by RemotePty (it doesn't run a local command at all — see
+    // startRemotePty in view.ts) but resolveStartupCommand() still runs
+    // unconditionally before that branch, so give it an honest empty value
+    // rather than falling through to the Claude Code startup command below.
+    if (backend === "remote") return "";
     if (backend === "codex") return "codex";
     if (backend === "antigravity") return "agy";
     if (backend === "ollama") {
@@ -307,10 +350,18 @@ export default class ObsidianAgentMCP extends Plugin {
   // Agents shown in the in-terminal switcher: every agent the user has enabled,
   // whether or not its CLI is installed. Selecting an uninstalled one shows an
   // install prompt in the terminal instead of launching.
+  //
+  // On mobile only "remote" is filtered in: every other entry spawns a local
+  // process (a local pty, or a local CLI binary), which is simply impossible
+  // there — showing them in the switcher would let the user "select" an
+  // agent that silently does nothing it claims to do. view.ts additionally
+  // forces the running session to "remote" on mobile regardless of this list,
+  // but filtering here too keeps the dropdown itself from lying about what
+  // switching to another entry would actually run.
   private enabledBackendList(): Array<{ id: AgentBackend; label: string }> {
-    return AGENT_BACKENDS
-      .filter(b => this.settings.terminal.enabledBackends[b.id])
-      .map(({ id, label }) => ({ id, label }));
+    const enabled = AGENT_BACKENDS.filter(b => this.settings.terminal.enabledBackends[b.id]);
+    const usable = Platform.isMobile ? enabled.filter(b => b.id === "remote") : enabled;
+    return usable.map(({ id, label }) => ({ id, label }));
   }
 
   // The binary probed to decide availability. For Claude a custom startup command
@@ -334,19 +385,37 @@ export default class ObsidianAgentMCP extends Plugin {
   }
 
   getBackendAvailability(backend: AgentBackend): Availability {
+    if (Platform.isMobile) {
+      // No local process of any kind can run on mobile — only "remote" has a
+      // real, probed state (via GET /info, see ensureMobile); everything
+      // else is unconditionally missing rather than the desktop shortcut
+      // ("available" for anything with no CLI to probe) below.
+      return backend === "remote" ? this.availability.get(backend) : "missing";
+    }
     return this.resolveBackendCli(backend) ? this.availability.get(backend) : "available";
   }
 
   ensureBackendAvailability(backend: AgentBackend): Promise<Availability> {
+    if (Platform.isMobile) return this.availability.ensureMobile(backend, this.mobileRemoteProbeTarget());
     const cli = this.resolveBackendCli(backend);
     if (!cli) return Promise.resolve<Availability>("available");
     return this.availability.ensure(backend, cli, this.probeShell());
   }
 
   recheckBackendAvailability(backend: AgentBackend): Promise<Availability> {
+    if (Platform.isMobile) return this.availability.recheckMobile(backend, this.mobileRemoteProbeTarget());
     const cli = this.resolveBackendCli(backend);
     if (!cli) return Promise.resolve<Availability>("available");
     return this.availability.recheck(backend, cli, this.probeShell());
+  }
+
+  // The daemon endpoint to check "remote"'s mobile availability against —
+  // null (never available) until the connection is actually configured, so
+  // this never fires a request that could only fail.
+  private mobileRemoteProbeTarget(): { url: string; token: string } | null {
+    const r = this.settings.terminal.remote;
+    if (!r.enabled || !r.url.trim() || !r.token.trim()) return null;
+    return { url: r.url.trim(), token: r.token.trim() };
   }
 
   // The in-terminal agent switcher persists its selection here so it becomes the

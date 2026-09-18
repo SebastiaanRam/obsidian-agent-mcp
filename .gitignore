@@ -20,3 +20,7 @@ node_modules/
 
 # Local-only docs (submission checklist, scanner review snapshots — kept out of the repo)
 docs/archive/
+
+# Python bytecode
+__pycache__/
+*.pyc

@@ -654,6 +654,8 @@ class TruncatedHistoryTests(unittest.TestCase):
         ).encode())
         attach_ok = [m for m in sent_text_messages(conn) if m["t"] == "attach_ok"][0]
         self.assertFalse(attach_ok["truncated_history"])
+        # base_offset is 0, so the replay starts at the true beginning.
+        self.assertEqual(attach_ok["seq"], 0)
         payloads = sent_binary_payloads(conn)
         self.assertNotIn(agent_ptyd.CLEAR_SCREEN_SEQUENCE, payloads)
         self.assertEqual(b"".join(payloads), b"hello world")
@@ -674,10 +676,30 @@ class TruncatedHistoryTests(unittest.TestCase):
         msgs = sent_text_messages(conn)
         attach_ok = [m for m in msgs if m["t"] == "attach_ok"][0]
         self.assertTrue(attach_ok["truncated_history"])
+        # The client never learns base_offset any other way -- this is what
+        # it must seed its own sequence counter from to stay exact on a
+        # later reconnect (see the comment on this field in _handle_attach).
+        self.assertEqual(attach_ok["seq"], 5000)
         self.assertNotIn("resync_required", [m["t"] for m in msgs])
         payloads = sent_binary_payloads(conn)
         self.assertEqual(payloads[0], agent_ptyd.CLEAR_SCREEN_SEQUENCE)
         self.assertEqual(b"".join(payloads[1:]), bytes(session._buf))
+
+    def test_resume_attach_ok_seq_matches_requested_last_seq(self):
+        daemon = make_daemon(token="right")
+        session = make_fake_session(daemon, cwd=daemon.config["root"])
+        session._buf = bytearray(b"continuation")
+        session.base_offset = 200
+        session.total_offset = session.base_offset + len(session._buf)
+        conn = make_conn(daemon)
+        do_hello(conn, daemon)
+        conn._handle_control_message(json.dumps(
+            {"t": "attach", "backend": "shell", "cwd": ".", "session_id": session.id, "cols": 80, "rows": 24, "last_seq": 200}
+        ).encode())
+        attach_ok = [m for m in sent_text_messages(conn) if m["t"] == "attach_ok"][0]
+        self.assertFalse(attach_ok["truncated_history"])
+        self.assertEqual(attach_ok["seq"], 200)
+        self.assertEqual(b"".join(sent_binary_payloads(conn)), b"continuation")
 
     def test_explicit_last_seq_zero_is_strict_resume_not_fresh(self):
         # last_seq: 0 explicitly (unlike an omitted last_seq) means "I've

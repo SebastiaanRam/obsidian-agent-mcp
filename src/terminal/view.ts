@@ -1,4 +1,4 @@
-import { ItemView, WorkspaceLeaf, setIcon } from "obsidian";
+import { ItemView, WorkspaceLeaf, setIcon, Platform } from "obsidian";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -6,6 +6,7 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { CanvasAddon } from "@xterm/addon-canvas";
 
 import { agentShell, defaultShell, spawnShell, type IPty } from "./pty";
+import { RemotePty } from "./remote";
 import { AGENT_BACKENDS, type AgentBackend } from "../settings";
 import type { Availability } from "./availability";
 
@@ -41,6 +42,18 @@ export interface TerminalConfig {
   onBackendChange: (backend: AgentBackend) => void;
   /** Opens this plugin's settings tab (toolbar gear button). */
   openSettings: () => void;
+  /** Remote daemon connection info; present only when backend "remote" is
+   * both enabled and fully configured (see main.ts's remoteConfig()).
+   * Undefined means "not configured" — selecting "remote" then shows a
+   * prompt to configure it rather than attempting a connection. */
+  remote?: {
+    url: string;
+    token: string;
+    cwd: string;
+    backend: string;
+    sessionId: string | null;
+    onSessionId: (id: string) => void;
+  };
 }
 
 export class AgentTerminalView extends ItemView {
@@ -89,9 +102,16 @@ export class AgentTerminalView extends ItemView {
     container.addClass("agent-mcp-terminal-container");
 
     this.cfg = this.configProvider();
-    this.currentBackend = this.cfg.backend;
+    // On mobile no local process can ever run — not a CLI agent, not even a
+    // plain shell — so "remote" is the only backend that's ever real there,
+    // regardless of what's persisted as the desktop default. main.ts's
+    // enabledBackendList() also filters the switcher itself down to just
+    // "remote" on mobile, so this never gets contradicted by a dropdown
+    // offering something switching to it wouldn't actually do.
+    this.currentBackend = Platform.isMobile ? "remote" : this.cfg.backend;
 
     this.buildToolbar(container);
+    if (Platform.isMobile) this.buildMobileKeyBar(container);
     this.host = container.createDiv({ cls: "agent-mcp-terminal-host" });
 
     void this.startSession();
@@ -121,6 +141,38 @@ export class AgentTerminalView extends ItemView {
     });
     setIcon(settingsBtn, "settings");
     this.registerDomEvent(settingsBtn, "click", () => this.cfg?.openSettings());
+  }
+
+  // A small accessory row of keys mobile soft keyboards don't have. Esc is
+  // first and most important: it's how Claude Code interrupts an agent
+  // mid-response, making it the most-used non-alphanumeric key while
+  // prompting, and there is no way to type it on a phone otherwise. Tab and
+  // the arrow keys cover the rest of what a soft keyboard omits. Deliberately
+  // NOT a full modifier system (no Ctrl/Alt) — Esc is what makes this usable
+  // at all; the rest can follow later if it's needed.
+  private buildMobileKeyBar(container: HTMLElement): void {
+    const bar = container.createDiv({ cls: "agent-mcp-terminal-keybar" });
+    const keys: Array<{ label: string; seq: string }> = [
+      { label: "Esc", seq: "\x1b" },
+      { label: "Tab", seq: "\t" },
+      { label: "↑", seq: "\x1b[A" },
+      { label: "↓", seq: "\x1b[B" },
+      { label: "←", seq: "\x1b[D" },
+      { label: "→", seq: "\x1b[C" },
+    ];
+    for (const { label, seq } of keys) {
+      const btn = bar.createEl("button", { cls: "agent-mcp-terminal-keybar-btn", text: label });
+      // touchstart, not click: a click only fires after the webview has
+      // already moved focus to the button, which dismisses the soft
+      // keyboard before the sequence is even sent. preventDefault() here
+      // stops the button from taking focus at all, so the keyboard — and
+      // the terminal's own focus — never drops.
+      this.registerDomEvent(btn, "touchstart", (e: TouchEvent) => {
+        e.preventDefault();
+        this.pty?.write(seq);
+        this.term?.focus();
+      });
+    }
   }
 
   // Rebuilds the switcher options from the current enabled/available agent list,
@@ -184,6 +236,15 @@ export class AgentTerminalView extends ItemView {
       }
     }
 
+    // Same shape of gate as the CLI check above, but for the remote backend:
+    // if it's selected without a full configuration (main.ts only sets
+    // cfg.remote once enabled + url + token + backend are all present), show
+    // a prompt instead of a dead pane.
+    if (backend === "remote" && !cfg.remote) {
+      this.renderRemoteNotConfiguredPanel(host);
+      return;
+    }
+
     const command = cfg.resolveStartupCommand(backend);
 
     const term = new Terminal({
@@ -209,6 +270,20 @@ export class AgentTerminalView extends ItemView {
 
     term.open(host);
 
+    if (Platform.isMobile) {
+      // xterm focuses its hidden input textarea from its own "mousedown"
+      // handler, which calls preventDefault() before this.focus(). On a
+      // touch-based mobile webview that's frequently not enough for the OS
+      // to treat it as a direct user gesture, so the soft keyboard never
+      // raises even though xterm's own model believes the terminal is
+      // focused. A real, unmodified "touchend" on the host reliably counts
+      // as one — focus explicitly from it as a defensive addition. This
+      // could not be visually verified in this environment (no real mobile
+      // webview available); confirm on an actual device that tapping the
+      // terminal raises the keyboard before relying on this.
+      this.registerDomEvent(host, "touchend", () => term.focus());
+    }
+
     // Canvas renderer renders block characters (▀▄█▐▌) and box-drawing chars
     // crisply with no anti-aliasing seams — which the Claude Code splash logo
     // relies on. It must be loaded AFTER .open().
@@ -225,7 +300,9 @@ export class AgentTerminalView extends ItemView {
     this.scheduleInitialFit(host);
 
     try {
-      this.pty = this.startPty(cfg, command, term.cols, term.rows);
+      this.pty = backend === "remote" && cfg.remote
+        ? this.startRemotePty(cfg.remote, term.cols, term.rows)
+        : this.startPty(cfg, command, term.cols, term.rows);
     } catch (err) {
       // Only synchronous throws from spawnShell() land here — i.e. writeFileSync
       // failing to write the bridge script (missing plugin dir, permissions).
@@ -249,6 +326,22 @@ export class AgentTerminalView extends ItemView {
   private renderInfoPanel(host: HTMLElement, message: string): void {
     const panel = host.createDiv({ cls: "agent-mcp-terminal-message" });
     panel.createDiv({ cls: "agent-mcp-terminal-message-body", text: message });
+  }
+
+  // Shown when "Remote" is selected but main.ts didn't supply cfg.remote —
+  // i.e. it isn't fully configured yet (enabled + URL + token + backend all
+  // set). Mirrors renderMissingPanel's shape for a CLI agent: no attempt to
+  // connect, just where to go fix it.
+  private renderRemoteNotConfiguredPanel(host: HTMLElement): void {
+    const panel = host.createDiv({ cls: "agent-mcp-terminal-message" });
+    panel.createDiv({ cls: "agent-mcp-terminal-message-title", text: "Remote backend not configured" });
+    panel.createDiv({
+      cls: "agent-mcp-terminal-message-body",
+      text: "Set a daemon URL, auth token, and remote backend in the plugin settings.",
+    });
+    const actions = panel.createDiv({ cls: "agent-mcp-terminal-message-actions" });
+    const settings = actions.createEl("button", { text: "Open settings" });
+    this.registerDomEvent(settings, "click", () => this.cfg?.openSettings());
   }
 
   // Shown instead of launching a CLI-backed agent whose tool isn't installed. No
@@ -354,6 +447,24 @@ export class AgentTerminalView extends ItemView {
       env: cfg.env,
       cols: Math.max(cols, 2),
       rows: Math.max(rows, 2),
+    });
+  }
+
+  // Builds a RemotePty (see remote.ts) instead of spawning a local shell.
+  // Synchronous like startPty(), even though the actual connection happens
+  // asynchronously inside RemotePty — it reports its own "connecting…" and
+  // any errors through onData once wirePtyToTerm subscribes, right after
+  // this returns.
+  private startRemotePty(remote: NonNullable<TerminalConfig["remote"]>, cols: number, rows: number): IPty {
+    return new RemotePty({
+      url: remote.url,
+      token: remote.token,
+      backend: remote.backend,
+      cwd: remote.cwd,
+      cols: Math.max(cols, 2),
+      rows: Math.max(rows, 2),
+      sessionId: remote.sessionId ?? undefined,
+      onSessionId: remote.onSessionId,
     });
   }
 

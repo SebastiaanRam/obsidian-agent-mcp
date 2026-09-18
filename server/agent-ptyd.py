@@ -40,7 +40,7 @@ PROTOCOL
       pong     {t, ts}
     server -> client
       hello_ok        {t, proto}
-      attach_ok       {t, session_id, backend, cwd, cols, rows, created, resumed, truncated_history}
+      attach_ok       {t, session_id, backend, cwd, cols, rows, created, resumed, truncated_history, seq}
       exit            {t, session_id, code, signal}
       resync_required {t, reason}   # "buffer_expired" | "invalid_seq"
       error           {t, code, message}
@@ -57,7 +57,11 @@ PROTOCOL
   still retained, but if the buffer has trimmed anything that replay starts
   at an arbitrary raw-byte boundary (mid-UTF-8, mid-escape), so it's
   preceded by a terminal-clear sequence and flagged `truncated_history` in
-  attach_ok rather than presented as a faithful, complete screen. WebSocket-
+  attach_ok rather than presented as a faithful, complete screen. attach_ok's
+  `seq` is the absolute offset that replay starts at (not total_offset) —
+  a client seeds its own counter from it, then increments per byte received
+  (skipping the clear sequence), so a later exact reconnect stays accurate
+  even though the client never learns base_offset any other way. WebSocket-
   level PING/PONG frames exist for browsers (which auto-reply to a server
   PING) but nothing lets browser JS *send* one, and a non-browser client may
   not implement WS ping/pong at all — so liveness is also checked with the
@@ -949,7 +953,8 @@ class ClientConnection(object):
             # it already applied, so the replay is byte-aligned by
             # construction — exact continuation, or resync if we can no
             # longer serve it. Unchanged from before.
-            ok, data = session.replay_from(last_seq)
+            replay_from_seq = last_seq
+            ok, data = session.replay_from(replay_from_seq)
             if not ok:
                 reason = "invalid_seq" if last_seq > session.total_offset else "buffer_expired"
             truncated = False
@@ -964,7 +969,8 @@ class ClientConnection(object):
             # or two lands on a blank screen, not on top of real content)
             # and flag the replay as truncated so the client treats it as
             # partial scrollback rather than a faithful, complete screen.
-            ok, data = session.replay_from(session.base_offset)
+            replay_from_seq = session.base_offset
+            ok, data = session.replay_from(replay_from_seq)
             reason = None
             truncated = session.base_offset > 0
 
@@ -972,6 +978,19 @@ class ClientConnection(object):
             "t": "attach_ok", "session_id": session.id, "backend": session.backend,
             "cwd": session.cwd_rel, "cols": cols, "rows": rows,
             "created": session.created, "resumed": resumed, "truncated_history": truncated,
+            # The absolute offset the replay that follows (if any) starts
+            # from — NOT session.total_offset. A client that just counts
+            # every byte it receives has no way to know where a *fresh*
+            # attach's replay began (it never learned base_offset), so on a
+            # later exact-offset reconnect it would send an undercounted
+            # last_seq. That's not just inexact: because base_offset only
+            # ever grows, the undercount can eventually land back inside
+            # [base_offset, total_offset) by coincidence, and replay_from
+            # would then silently serve an earlier slice than intended —
+            # duplicated output, not just a wasted resync. Seeding the
+            # client's counter from this field (then incrementing per byte
+            # received, excluding CLEAR_SCREEN_SEQUENCE) keeps it exact.
+            "seq": replay_from_seq,
         })
 
         if not ok:
