@@ -1,4 +1,4 @@
-import { ItemView, WorkspaceLeaf, setIcon, Platform } from "obsidian";
+import { ItemView, WorkspaceLeaf, setIcon, Platform, Notice } from "obsidian";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -13,6 +13,10 @@ import type { Availability } from "./availability";
 export const AGENT_TERMINAL_VIEW_TYPE = "agent-terminal";
 
 const RESIZE_DEBOUNCE_MS = 60;
+
+// Below this many px of visualViewport shrinkage, treat it as noise (browser
+// chrome show/hide, a rounding wobble) rather than the soft keyboard opening.
+const KEYBOARD_MIN_INSET_PX = 80;
 
 export interface TerminalConfig {
   // Desktop-only: read only by startPty() to spawn a local pty, which never
@@ -72,6 +76,13 @@ export class AgentTerminalView extends ItemView {
   private currentBackend: AgentBackend = "claude";
   private host: HTMLElement | null = null;
   private select: HTMLSelectElement | null = null;
+  // Mobile composer state (see buildMobileComposer). Untouched on desktop.
+  private composerEl: HTMLElement | null = null;
+  private composerTextarea: HTMLTextAreaElement | null = null;
+  private composerSendBtn: HTMLButtonElement | null = null;
+  private rawModeToggle: HTMLButtonElement | null = null;
+  private rawMode = false;
+  private composerInsetRafScheduled = false;
   // Bumped on every start/switch so an async availability probe from a superseded
   // session can't spawn into the wrong (or a torn-down) terminal.
   private sessionSeq = 0;
@@ -115,8 +126,8 @@ export class AgentTerminalView extends ItemView {
     this.currentBackend = Platform.isMobile ? "remote" : this.cfg.backend;
 
     this.buildToolbar(container);
-    if (Platform.isMobile) this.buildMobileKeyBar(container);
     this.host = container.createDiv({ cls: "agent-mcp-terminal-host" });
+    if (Platform.isMobile) this.buildMobileComposer(container);
 
     void this.startSession();
   }
@@ -147,36 +158,248 @@ export class AgentTerminalView extends ItemView {
     this.registerDomEvent(settingsBtn, "click", () => this.cfg?.openSettings());
   }
 
-  // A small accessory row of keys mobile soft keyboards don't have. Esc is
-  // first and most important: it's how Claude Code interrupts an agent
-  // mid-response, making it the most-used non-alphanumeric key while
-  // prompting, and there is no way to type it on a phone otherwise. Tab and
-  // the arrow keys cover the rest of what a soft keyboard omits. Deliberately
-  // NOT a full modifier system (no Ctrl/Alt) — Esc is what makes this usable
-  // at all; the rest can follow later if it's needed.
-  private buildMobileKeyBar(container: HTMLElement): void {
-    const bar = container.createDiv({ cls: "agent-mcp-terminal-keybar" });
-    const keys: Array<{ label: string; seq: string }> = [
-      { label: "Esc", seq: "\x1b" },
-      { label: "Tab", seq: "\t" },
-      { label: "↑", seq: "\x1b[A" },
-      { label: "↓", seq: "\x1b[B" },
-      { label: "←", seq: "\x1b[D" },
-      { label: "→", seq: "\x1b[C" },
+  // Mobile-only composer, pinned above the soft keyboard. Typing happens in
+  // this ordinary <textarea>, never in xterm's hidden input: a real textarea
+  // focuses reliably from a tap (xterm's own mousedown-based focus frequently
+  // isn't recognised as a direct gesture in a mobile webview — see the
+  // touchend workaround in startSession()) and it lets the platform's normal
+  // autocorrect/predictive text/auto-caps run without corrupting the pty
+  // stream a keystroke at a time, since nothing reaches the pty until the
+  // user explicitly hits Send. This also folds in the old top-of-view
+  // Esc/Tab/arrow row (buildMobileKeyBar): those controls move down here,
+  // next to where the user's thumb and the keyboard already are, alongside a
+  // new Ctrl-C — the universal interrupt, and previously not sendable at all.
+  private buildMobileComposer(container: HTMLElement): void {
+    const composer = container.createDiv({ cls: "agent-mcp-terminal-composer" });
+    this.composerEl = composer;
+
+    const controls = composer.createDiv({ cls: "agent-mcp-terminal-composer-controls" });
+    const keys: Array<{ label: string; seq: string; title: string }> = [
+      { label: "Esc", seq: "\x1b", title: "Escape" },
+      // Esc only interrupts an agent CLI's own turn; Ctrl-C is the one way
+      // to kill a runaway process under the shell backend, and until now
+      // there was no way to send it from mobile at all.
+      { label: "^C", seq: "\x03", title: "Interrupt (Ctrl-C)" },
+      { label: "Tab", seq: "\t", title: "Tab" },
+      { label: "↑", seq: "\x1b[A", title: "Up" },
+      { label: "↓", seq: "\x1b[B", title: "Down" },
+      { label: "←", seq: "\x1b[D", title: "Left" },
+      { label: "→", seq: "\x1b[C", title: "Right" },
     ];
-    for (const { label, seq } of keys) {
-      const btn = bar.createEl("button", { cls: "agent-mcp-terminal-keybar-btn", text: label });
+    for (const { label, seq, title } of keys) {
+      const btn = controls.createEl("button", {
+        cls: "agent-mcp-terminal-composer-key",
+        text: label,
+        attr: { "aria-label": title },
+      });
       // touchstart, not click: a click only fires after the webview has
-      // already moved focus to the button, which dismisses the soft
-      // keyboard before the sequence is even sent. preventDefault() here
-      // stops the button from taking focus at all, so the keyboard — and
-      // the terminal's own focus — never drops.
+      // already moved focus to the button, which would dismiss the soft
+      // keyboard (or drop xterm's focus in raw mode) before the byte is even
+      // sent. preventDefault() stops the button from taking focus at all.
       this.registerDomEvent(btn, "touchstart", (e: TouchEvent) => {
         e.preventDefault();
         this.pty?.write(seq);
-        this.term?.focus();
+        if (this.rawMode) this.term?.focus();
       });
     }
+
+    const rawToggle = controls.createEl("button", {
+      cls: "agent-mcp-terminal-composer-raw-toggle",
+      text: "Raw",
+      attr: { "aria-label": "Toggle raw keystroke mode" },
+    });
+    this.rawModeToggle = rawToggle;
+    this.registerDomEvent(rawToggle, "touchstart", (e: TouchEvent) => {
+      e.preventDefault();
+      this.setRawMode(!this.rawMode);
+    });
+
+    const inputRow = composer.createDiv({ cls: "agent-mcp-terminal-composer-input-row" });
+    const textarea = inputRow.createEl("textarea", {
+      cls: "agent-mcp-terminal-composer-textarea",
+      attr: {
+        rows: "1",
+        placeholder: "Message",
+        // "enter", not "send": Return always inserts a newline here (phones
+        // have no practical Shift key for the usual Shift+Enter split), so
+        // the return key's own label must not promise that it submits.
+        enterkeyhint: "enter",
+      },
+    });
+    this.composerTextarea = textarea;
+
+    this.registerDomEvent(textarea, "input", () => this.autoGrowComposerTextarea());
+    this.registerDomEvent(textarea, "keydown", (e: KeyboardEvent) => {
+      if (e.key !== "Tab") return;
+      // The composer can't drive per-keystroke completion (that needs Raw
+      // mode, below), and the browser's default behaviour for Tab in a text
+      // field is to move focus to the next element — silently stealing it
+      // from the composer. Insert a literal tab character instead, so Tab
+      // always does exactly one well-defined thing here.
+      e.preventDefault();
+      insertAtCursor(textarea, "\t");
+      this.autoGrowComposerTextarea();
+    });
+
+    const sendBtn = inputRow.createEl("button", {
+      cls: "agent-mcp-terminal-composer-send",
+      attr: { "aria-label": "Send" },
+    });
+    setIcon(sendBtn, "send");
+    this.composerSendBtn = sendBtn;
+    this.registerDomEvent(sendBtn, "touchstart", (e: TouchEvent) => {
+      e.preventDefault();
+      this.sendComposerText();
+    });
+
+    const vv = window.visualViewport;
+    if (vv) {
+      const onViewportChange = () => this.scheduleKeyboardInsetUpdate();
+      vv.addEventListener("resize", onViewportChange);
+      vv.addEventListener("scroll", onViewportChange);
+      // Tied to the view's own lifetime (unregistered on unload/onClose),
+      // not the pty session's: stopSession()/startSession() run on every
+      // agent switch, but the composer itself is built once in onOpen and
+      // outlives session restarts.
+      this.register(() => {
+        vv.removeEventListener("resize", onViewportChange);
+        vv.removeEventListener("scroll", onViewportChange);
+      });
+      // Establish a baseline in case the view opens while a keyboard is
+      // already up (e.g. re-focusing the app mid-edit elsewhere).
+      this.scheduleKeyboardInsetUpdate();
+    }
+    // No `else`: without visualViewport support the composer simply stays in
+    // its resting flex position (still above the fold at rest) rather than
+    // erroring — it just won't track a keyboard that hides it on that engine.
+  }
+
+  // Raw mode gives xterm's hidden textarea real focus so per-keystroke input
+  // works again (tab completion, Ctrl-R, curses apps like vim or htop) —
+  // things a composer fundamentally can't drive, since it only ever hands
+  // over complete lines. The composer's own textarea is disabled while it's
+  // on, both so typing can't land in two places at once and as part of the
+  // visual change below — the user must never have to wonder which mode
+  // they're in.
+  private setRawMode(next: boolean): void {
+    this.rawMode = next;
+    this.composerEl?.classList.toggle("is-raw-mode", next);
+    this.rawModeToggle?.classList.toggle("is-active", next);
+    this.rawModeToggle?.setText(next ? "Raw: On" : "Raw");
+    if (this.composerTextarea) {
+      this.composerTextarea.disabled = next;
+      this.composerTextarea.placeholder = next ? "Raw mode — tap the terminal to type" : "Message";
+    }
+    if (this.composerSendBtn) this.composerSendBtn.disabled = next;
+    if (next) {
+      this.composerTextarea?.blur();
+      this.term?.focus();
+    } else {
+      this.term?.textarea?.blur();
+      this.composerTextarea?.focus();
+    }
+  }
+
+  private autoGrowComposerTextarea(): void {
+    const ta = this.composerTextarea;
+    if (!ta) return;
+    // Reset before measuring so scrollHeight reflects the current content
+    // (not a stale, larger height) — needed for the box to shrink back down
+    // when text is deleted, not just grow. max-height in CSS caps this.
+    ta.style.removeProperty("height");
+    ta.style.height = `${ta.scrollHeight}px`;
+  }
+
+  private sendComposerText(): void {
+    const ta = this.composerTextarea;
+    const pty = this.pty;
+    if (!ta || !pty || this.rawMode) return;
+    const text = ta.value;
+    if (!text) return;
+    ta.value = "";
+    this.autoGrowComposerTextarea();
+    this.sendComposedText(pty, text);
+  }
+
+  // Multi-line composer text can't be sent as literal bytes with an embedded
+  // "\n": an agent CLI (or a plain shell) reading the pty in line mode takes
+  // the FIRST newline as Enter and submits whatever was typed so far, so
+  // every following line arrives as its own separate, later prompt instead
+  // of being part of the one message the user composed. Bracketed paste
+  // (CSI 200~ ... CSI 201~) is how a terminal tells the app on the other end
+  // "the newlines in here are content, not Enter" — it isn't a formatting
+  // nicety, it's the only mechanism that lets a multi-line message survive
+  // as a single message at all.
+  //
+  // That only works if the app on the other end actually asked for it via
+  // CSI ?2004h — xterm tracks whether it did as term.modes.bracketedPasteMode,
+  // driven entirely by what the pty side has sent, never assumed here. An
+  // app that never enabled it wouldn't strip the CSI 200~/201~ markers
+  // either — they'd show up as literal garbage in its input line instead of
+  // vanishing. With no reliable way to preserve real newlines against an app
+  // we know doesn't support them, lines are joined with spaces instead: a
+  // visibly different but still-single, still-correct submission, rather
+  // than silently refragmenting into several separate prompts.
+  private sendComposedText(pty: IPty, text: string): void {
+    if (!text.includes("\n")) {
+      pty.write(text + "\r");
+      return;
+    }
+    if (this.term?.modes.bracketedPasteMode) {
+      pty.write("\x1b[200~" + text + "\x1b[201~\r");
+      return;
+    }
+    pty.write(text.replace(/\n+/g, " ") + "\r");
+    new Notice("This session hasn't enabled multi-line input — sent as one line.");
+  }
+
+  private scheduleKeyboardInsetUpdate(): void {
+    if (this.composerInsetRafScheduled) return;
+    this.composerInsetRafScheduled = true;
+    window.requestAnimationFrame(() => {
+      this.composerInsetRafScheduled = false;
+      this.applyKeyboardInset();
+    });
+  }
+
+  // Pins the composer above the soft keyboard by giving it enough
+  // padding-bottom to reach the keyboard's top edge — not position: fixed.
+  // The composer is already the last flex child of the container, so
+  // growing its own box by exactly the keyboard's height shrinks the
+  // terminal host by the same amount through the very same
+  // ResizeObserver → scheduleResize → applyResize path used for every other
+  // resize, which keeps the pty's rows/cols and xterm's rendered rows
+  // consistent with what's actually visible for free — see applyResize()'s
+  // mobile scrollToBottom() call for the other half of that.
+  //
+  // iOS in particular does not shrink window.innerHeight when the keyboard
+  // opens (the whole reason this exists), so window.innerHeight is the one
+  // stable reference for "how much of the layout viewport isn't visible
+  // right now" — that gap is read from visualViewport, never assumed.
+  private applyKeyboardInset(): void {
+    const composer = this.composerEl;
+    const vv = window.visualViewport;
+    if (!composer || !vv) return;
+
+    const scale = vv.scale || 1;
+    // vv.height/offsetTop shrink for two unrelated reasons — the keyboard
+    // opening, or the user pinching to zoom in — and look identical as raw
+    // numbers. Multiplying back by `scale` converts the zoomed visual
+    // viewport back to layout-viewport-equivalent pixels (the units
+    // window.innerHeight is already in), so a pure pinch-zoom with the
+    // keyboard still closed cancels back out to ~0 instead of being misread
+    // as a keyboard opening.
+    const visibleBottom = (vv.offsetTop + vv.height) * scale;
+    const keyboardInset = Math.max(0, Math.round(window.innerHeight - visibleBottom));
+    const keyboardOpen = keyboardInset > KEYBOARD_MIN_INSET_PX;
+
+    // Below the threshold, clear the inline style so the CSS rule's own
+    // env(safe-area-inset-bottom) takes over again. Once the keyboard is
+    // open, the visible viewport already ends AT the keyboard's top edge —
+    // past where the home indicator would be — so also keeping that padding
+    // would double-count the same strip of screen and leave a dead gap
+    // between the composer and the keyboard.
+    composer.style.paddingBottom = keyboardOpen ? `${keyboardInset}px` : "";
   }
 
   // Rebuilds the switcher options from the current enabled/available agent list,
@@ -275,17 +498,35 @@ export class AgentTerminalView extends ItemView {
     term.open(host);
 
     if (Platform.isMobile) {
+      // Raw mode (setRawMode) is the only place xterm's hidden textarea gets
+      // focus at all on mobile — everywhere else, typing goes through the
+      // composer instead (see buildMobileComposer), specifically so this
+      // textarea's own autocorrect/auto-caps never runs against a live pty
+      // stream one keystroke at a time. It still needs these attributes for
+      // when raw mode IS on: without them it silently auto-capitalises
+      // commands and substitutes smart quotes.
+      const ta = term.textarea;
+      if (ta) {
+        ta.setAttribute("autocapitalize", "off");
+        ta.setAttribute("autocorrect", "off");
+        ta.setAttribute("autocomplete", "off");
+        ta.setAttribute("spellcheck", "false");
+      }
       // xterm focuses its hidden input textarea from its own "mousedown"
       // handler, which calls preventDefault() before this.focus(). On a
       // touch-based mobile webview that's frequently not enough for the OS
       // to treat it as a direct user gesture, so the soft keyboard never
       // raises even though xterm's own model believes the terminal is
       // focused. A real, unmodified "touchend" on the host reliably counts
-      // as one — focus explicitly from it as a defensive addition. This
+      // as one — focus explicitly from it as a defensive addition, but only
+      // in raw mode: outside it, tapping the transcript must never focus
+      // xterm's hidden textarea (that's the composer's whole point). This
       // could not be visually verified in this environment (no real mobile
       // webview available); confirm on an actual device that tapping the
       // terminal raises the keyboard before relying on this.
-      this.registerDomEvent(host, "touchend", () => term.focus());
+      this.registerDomEvent(host, "touchend", () => {
+        if (this.rawMode) term.focus();
+      });
     }
 
     // Canvas renderer renders block characters (▀▄█▐▌) and box-drawing chars
@@ -323,7 +564,11 @@ export class AgentTerminalView extends ItemView {
     this.resizeObserver = new ResizeObserver(() => this.scheduleResize());
     this.resizeObserver.observe(host);
 
-    term.focus();
+    // On mobile, focus xterm's hidden textarea only if the user was already
+    // in raw mode before this (re)start (e.g. switching agents) — never as
+    // the default, since typing lives in the composer instead. Desktop is
+    // unaffected: it always focuses, exactly as before.
+    if (!Platform.isMobile || this.rawMode) term.focus();
   }
 
   // A transient status line while an agent's CLI is being probed.
@@ -430,6 +675,12 @@ export class AgentTerminalView extends ItemView {
       } else {
         this.pty.resize(this.term.cols, this.term.rows);
       }
+      // The composer growing to clear the keyboard (applyKeyboardInset)
+      // shrinks the host, which lands here through the same ResizeObserver
+      // as any other resize. Without this, the keyboard opening leaves the
+      // newest output hidden behind the composer until the user manually
+      // scrolls. Mobile-only: this must not change desktop's resize behaviour.
+      if (Platform.isMobile) this.term.scrollToBottom();
     } catch {
       // Transient races between xterm and the PTY on rapid resize — ignore.
     }
@@ -514,7 +765,21 @@ export class AgentTerminalView extends ItemView {
     this.host = null;
     this.cfg = null;
     this.select = null;
+    this.composerEl = null;
+    this.composerTextarea = null;
+    this.composerSendBtn = null;
+    this.rawModeToggle = null;
   }
+}
+
+// Inserts text at the caret (replacing any selection), for the composer's
+// literal-tab handling — plain DOM textareas have no other built-in way to
+// insert text at an arbitrary cursor position.
+function insertAtCursor(el: HTMLTextAreaElement, text: string): void {
+  const start = el.selectionStart ?? el.value.length;
+  const end = el.selectionEnd ?? el.value.length;
+  el.value = el.value.slice(0, start) + text + el.value.slice(end);
+  el.selectionStart = el.selectionEnd = start + text.length;
 }
 
 function readTheme() {

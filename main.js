@@ -11216,6 +11216,7 @@ var import_addon_unicode11 = __toESM(require_addon_unicode11());
 var import_addon_canvas = __toESM(require_addon_canvas());
 var AGENT_TERMINAL_VIEW_TYPE = "agent-terminal";
 var RESIZE_DEBOUNCE_MS = 60;
+var KEYBOARD_MIN_INSET_PX = 80;
 var AgentTerminalView = class extends import_obsidian4.ItemView {
   constructor(leaf, configProvider) {
     super(leaf);
@@ -11232,6 +11233,13 @@ var AgentTerminalView = class extends import_obsidian4.ItemView {
   currentBackend = "claude";
   host = null;
   select = null;
+  // Mobile composer state (see buildMobileComposer). Untouched on desktop.
+  composerEl = null;
+  composerTextarea = null;
+  composerSendBtn = null;
+  rawModeToggle = null;
+  rawMode = false;
+  composerInsetRafScheduled = false;
   // Bumped on every start/switch so an async availability probe from a superseded
   // session can't spawn into the wrong (or a torn-down) terminal.
   sessionSeq = 0;
@@ -11254,8 +11262,8 @@ var AgentTerminalView = class extends import_obsidian4.ItemView {
     this.cfg = this.configProvider();
     this.currentBackend = import_obsidian4.Platform.isMobile ? "remote" : this.cfg.backend;
     this.buildToolbar(container);
-    if (import_obsidian4.Platform.isMobile) this.buildMobileKeyBar(container);
     this.host = container.createDiv({ cls: "agent-mcp-terminal-host" });
+    if (import_obsidian4.Platform.isMobile) this.buildMobileComposer(container);
     void this.startSession();
   }
   // Toolbar with the agent switcher. Switching restarts the session with the
@@ -11280,31 +11288,200 @@ var AgentTerminalView = class extends import_obsidian4.ItemView {
     (0, import_obsidian4.setIcon)(settingsBtn, "settings");
     this.registerDomEvent(settingsBtn, "click", () => this.cfg?.openSettings());
   }
-  // A small accessory row of keys mobile soft keyboards don't have. Esc is
-  // first and most important: it's how Claude Code interrupts an agent
-  // mid-response, making it the most-used non-alphanumeric key while
-  // prompting, and there is no way to type it on a phone otherwise. Tab and
-  // the arrow keys cover the rest of what a soft keyboard omits. Deliberately
-  // NOT a full modifier system (no Ctrl/Alt) — Esc is what makes this usable
-  // at all; the rest can follow later if it's needed.
-  buildMobileKeyBar(container) {
-    const bar = container.createDiv({ cls: "agent-mcp-terminal-keybar" });
+  // Mobile-only composer, pinned above the soft keyboard. Typing happens in
+  // this ordinary <textarea>, never in xterm's hidden input: a real textarea
+  // focuses reliably from a tap (xterm's own mousedown-based focus frequently
+  // isn't recognised as a direct gesture in a mobile webview — see the
+  // touchend workaround in startSession()) and it lets the platform's normal
+  // autocorrect/predictive text/auto-caps run without corrupting the pty
+  // stream a keystroke at a time, since nothing reaches the pty until the
+  // user explicitly hits Send. This also folds in the old top-of-view
+  // Esc/Tab/arrow row (buildMobileKeyBar): those controls move down here,
+  // next to where the user's thumb and the keyboard already are, alongside a
+  // new Ctrl-C — the universal interrupt, and previously not sendable at all.
+  buildMobileComposer(container) {
+    const composer = container.createDiv({ cls: "agent-mcp-terminal-composer" });
+    this.composerEl = composer;
+    const controls = composer.createDiv({ cls: "agent-mcp-terminal-composer-controls" });
     const keys = [
-      { label: "Esc", seq: "\x1B" },
-      { label: "Tab", seq: "	" },
-      { label: "\u2191", seq: "\x1B[A" },
-      { label: "\u2193", seq: "\x1B[B" },
-      { label: "\u2190", seq: "\x1B[D" },
-      { label: "\u2192", seq: "\x1B[C" }
+      { label: "Esc", seq: "\x1B", title: "Escape" },
+      // Esc only interrupts an agent CLI's own turn; Ctrl-C is the one way
+      // to kill a runaway process under the shell backend, and until now
+      // there was no way to send it from mobile at all.
+      { label: "^C", seq: "", title: "Interrupt (Ctrl-C)" },
+      { label: "Tab", seq: "	", title: "Tab" },
+      { label: "\u2191", seq: "\x1B[A", title: "Up" },
+      { label: "\u2193", seq: "\x1B[B", title: "Down" },
+      { label: "\u2190", seq: "\x1B[D", title: "Left" },
+      { label: "\u2192", seq: "\x1B[C", title: "Right" }
     ];
-    for (const { label, seq } of keys) {
-      const btn = bar.createEl("button", { cls: "agent-mcp-terminal-keybar-btn", text: label });
+    for (const { label, seq, title } of keys) {
+      const btn = controls.createEl("button", {
+        cls: "agent-mcp-terminal-composer-key",
+        text: label,
+        attr: { "aria-label": title }
+      });
       this.registerDomEvent(btn, "touchstart", (e) => {
         e.preventDefault();
         this.pty?.write(seq);
-        this.term?.focus();
+        if (this.rawMode) this.term?.focus();
       });
     }
+    const rawToggle = controls.createEl("button", {
+      cls: "agent-mcp-terminal-composer-raw-toggle",
+      text: "Raw",
+      attr: { "aria-label": "Toggle raw keystroke mode" }
+    });
+    this.rawModeToggle = rawToggle;
+    this.registerDomEvent(rawToggle, "touchstart", (e) => {
+      e.preventDefault();
+      this.setRawMode(!this.rawMode);
+    });
+    const inputRow = composer.createDiv({ cls: "agent-mcp-terminal-composer-input-row" });
+    const textarea = inputRow.createEl("textarea", {
+      cls: "agent-mcp-terminal-composer-textarea",
+      attr: {
+        rows: "1",
+        placeholder: "Message",
+        // "enter", not "send": Return always inserts a newline here (phones
+        // have no practical Shift key for the usual Shift+Enter split), so
+        // the return key's own label must not promise that it submits.
+        enterkeyhint: "enter"
+      }
+    });
+    this.composerTextarea = textarea;
+    this.registerDomEvent(textarea, "input", () => this.autoGrowComposerTextarea());
+    this.registerDomEvent(textarea, "keydown", (e) => {
+      if (e.key !== "Tab") return;
+      e.preventDefault();
+      insertAtCursor(textarea, "	");
+      this.autoGrowComposerTextarea();
+    });
+    const sendBtn = inputRow.createEl("button", {
+      cls: "agent-mcp-terminal-composer-send",
+      attr: { "aria-label": "Send" }
+    });
+    (0, import_obsidian4.setIcon)(sendBtn, "send");
+    this.composerSendBtn = sendBtn;
+    this.registerDomEvent(sendBtn, "touchstart", (e) => {
+      e.preventDefault();
+      this.sendComposerText();
+    });
+    const vv = window.visualViewport;
+    if (vv) {
+      const onViewportChange = () => this.scheduleKeyboardInsetUpdate();
+      vv.addEventListener("resize", onViewportChange);
+      vv.addEventListener("scroll", onViewportChange);
+      this.register(() => {
+        vv.removeEventListener("resize", onViewportChange);
+        vv.removeEventListener("scroll", onViewportChange);
+      });
+      this.scheduleKeyboardInsetUpdate();
+    }
+  }
+  // Raw mode gives xterm's hidden textarea real focus so per-keystroke input
+  // works again (tab completion, Ctrl-R, curses apps like vim or htop) —
+  // things a composer fundamentally can't drive, since it only ever hands
+  // over complete lines. The composer's own textarea is disabled while it's
+  // on, both so typing can't land in two places at once and as part of the
+  // visual change below — the user must never have to wonder which mode
+  // they're in.
+  setRawMode(next) {
+    this.rawMode = next;
+    this.composerEl?.classList.toggle("is-raw-mode", next);
+    this.rawModeToggle?.classList.toggle("is-active", next);
+    this.rawModeToggle?.setText(next ? "Raw: On" : "Raw");
+    if (this.composerTextarea) {
+      this.composerTextarea.disabled = next;
+      this.composerTextarea.placeholder = next ? "Raw mode \u2014 tap the terminal to type" : "Message";
+    }
+    if (this.composerSendBtn) this.composerSendBtn.disabled = next;
+    if (next) {
+      this.composerTextarea?.blur();
+      this.term?.focus();
+    } else {
+      this.term?.textarea?.blur();
+      this.composerTextarea?.focus();
+    }
+  }
+  autoGrowComposerTextarea() {
+    const ta = this.composerTextarea;
+    if (!ta) return;
+    ta.style.removeProperty("height");
+    ta.style.height = `${ta.scrollHeight}px`;
+  }
+  sendComposerText() {
+    const ta = this.composerTextarea;
+    const pty = this.pty;
+    if (!ta || !pty || this.rawMode) return;
+    const text = ta.value;
+    if (!text) return;
+    ta.value = "";
+    this.autoGrowComposerTextarea();
+    this.sendComposedText(pty, text);
+  }
+  // Multi-line composer text can't be sent as literal bytes with an embedded
+  // "\n": an agent CLI (or a plain shell) reading the pty in line mode takes
+  // the FIRST newline as Enter and submits whatever was typed so far, so
+  // every following line arrives as its own separate, later prompt instead
+  // of being part of the one message the user composed. Bracketed paste
+  // (CSI 200~ ... CSI 201~) is how a terminal tells the app on the other end
+  // "the newlines in here are content, not Enter" — it isn't a formatting
+  // nicety, it's the only mechanism that lets a multi-line message survive
+  // as a single message at all.
+  //
+  // That only works if the app on the other end actually asked for it via
+  // CSI ?2004h — xterm tracks whether it did as term.modes.bracketedPasteMode,
+  // driven entirely by what the pty side has sent, never assumed here. An
+  // app that never enabled it wouldn't strip the CSI 200~/201~ markers
+  // either — they'd show up as literal garbage in its input line instead of
+  // vanishing. With no reliable way to preserve real newlines against an app
+  // we know doesn't support them, lines are joined with spaces instead: a
+  // visibly different but still-single, still-correct submission, rather
+  // than silently refragmenting into several separate prompts.
+  sendComposedText(pty, text) {
+    if (!text.includes("\n")) {
+      pty.write(text + "\r");
+      return;
+    }
+    if (this.term?.modes.bracketedPasteMode) {
+      pty.write("\x1B[200~" + text + "\x1B[201~\r");
+      return;
+    }
+    pty.write(text.replace(/\n+/g, " ") + "\r");
+    new import_obsidian4.Notice("This session hasn't enabled multi-line input \u2014 sent as one line.");
+  }
+  scheduleKeyboardInsetUpdate() {
+    if (this.composerInsetRafScheduled) return;
+    this.composerInsetRafScheduled = true;
+    window.requestAnimationFrame(() => {
+      this.composerInsetRafScheduled = false;
+      this.applyKeyboardInset();
+    });
+  }
+  // Pins the composer above the soft keyboard by giving it enough
+  // padding-bottom to reach the keyboard's top edge — not position: fixed.
+  // The composer is already the last flex child of the container, so
+  // growing its own box by exactly the keyboard's height shrinks the
+  // terminal host by the same amount through the very same
+  // ResizeObserver → scheduleResize → applyResize path used for every other
+  // resize, which keeps the pty's rows/cols and xterm's rendered rows
+  // consistent with what's actually visible for free — see applyResize()'s
+  // mobile scrollToBottom() call for the other half of that.
+  //
+  // iOS in particular does not shrink window.innerHeight when the keyboard
+  // opens (the whole reason this exists), so window.innerHeight is the one
+  // stable reference for "how much of the layout viewport isn't visible
+  // right now" — that gap is read from visualViewport, never assumed.
+  applyKeyboardInset() {
+    const composer = this.composerEl;
+    const vv = window.visualViewport;
+    if (!composer || !vv) return;
+    const scale = vv.scale || 1;
+    const visibleBottom = (vv.offsetTop + vv.height) * scale;
+    const keyboardInset = Math.max(0, Math.round(window.innerHeight - visibleBottom));
+    const keyboardOpen = keyboardInset > KEYBOARD_MIN_INSET_PX;
+    composer.style.paddingBottom = keyboardOpen ? `${keyboardInset}px` : "";
   }
   // Rebuilds the switcher options from the current enabled/available agent list,
   // always including the running agent so the control reflects the live session.
@@ -11383,7 +11560,16 @@ var AgentTerminalView = class extends import_obsidian4.ItemView {
     term.unicode.activeVersion = "11";
     term.open(host);
     if (import_obsidian4.Platform.isMobile) {
-      this.registerDomEvent(host, "touchend", () => term.focus());
+      const ta = term.textarea;
+      if (ta) {
+        ta.setAttribute("autocapitalize", "off");
+        ta.setAttribute("autocorrect", "off");
+        ta.setAttribute("autocomplete", "off");
+        ta.setAttribute("spellcheck", "false");
+      }
+      this.registerDomEvent(host, "touchend", () => {
+        if (this.rawMode) term.focus();
+      });
     }
     try {
       term.loadAddon(new import_addon_canvas.CanvasAddon());
@@ -11402,7 +11588,7 @@ var AgentTerminalView = class extends import_obsidian4.ItemView {
     this.wirePtyToTerm(this.pty, term);
     this.resizeObserver = new ResizeObserver(() => this.scheduleResize());
     this.resizeObserver.observe(host);
-    term.focus();
+    if (!import_obsidian4.Platform.isMobile || this.rawMode) term.focus();
   }
   // A transient status line while an agent's CLI is being probed.
   renderInfoPanel(host, message) {
@@ -11492,6 +11678,7 @@ var AgentTerminalView = class extends import_obsidian4.ItemView {
       } else {
         this.pty.resize(this.term.cols, this.term.rows);
       }
+      if (import_obsidian4.Platform.isMobile) this.term.scrollToBottom();
     } catch {
     }
   }
@@ -11570,8 +11757,18 @@ var AgentTerminalView = class extends import_obsidian4.ItemView {
     this.host = null;
     this.cfg = null;
     this.select = null;
+    this.composerEl = null;
+    this.composerTextarea = null;
+    this.composerSendBtn = null;
+    this.rawModeToggle = null;
   }
 };
+function insertAtCursor(el, text) {
+  const start = el.selectionStart ?? el.value.length;
+  const end = el.selectionEnd ?? el.value.length;
+  el.value = el.value.slice(0, start) + text + el.value.slice(end);
+  el.selectionStart = el.selectionEnd = start + text.length;
+}
 function readTheme() {
   const styles = activeWindow.getComputedStyle(activeDocument.body);
   const v = (name, fallback) => styles.getPropertyValue(name).trim() || fallback;

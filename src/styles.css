@@ -41,21 +41,90 @@
   margin-left: auto;
 }
 
-/* Mobile-only accessory row for keys soft keyboards omit (Esc, Tab, arrows). */
-.agent-mcp-terminal-keybar {
+/*
+ * Mobile-only composer, pinned above the soft keyboard (see
+ * applyKeyboardInset() in view.ts, which drives padding-bottom below). Sits
+ * as the last flex child of the container so growing it to clear the
+ * keyboard shrinks the terminal host through the normal flex/ResizeObserver
+ * path, with no position: fixed involved.
+ */
+.agent-mcp-terminal-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  padding-bottom: env(safe-area-inset-bottom);
+  border-top: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+}
+
+/* Raw mode's visual tell — a border/background change, not just the toggle
+ * button's own state, so the user never has to check the button to know
+ * whether typing is about to go through autocorrect-free or not. */
+.agent-mcp-terminal-composer.is-raw-mode {
+  border-top: 2px solid var(--text-accent);
+  background: var(--background-modifier-hover);
+}
+
+.agent-mcp-terminal-composer-controls {
   display: flex;
   gap: 6px;
-  padding: 6px 10px;
-  border-bottom: 1px solid var(--background-modifier-border);
-  flex: 0 0 auto;
   overflow-x: auto;
 }
 
-.agent-mcp-terminal-keybar-btn {
+.agent-mcp-terminal-composer-key {
   flex: 0 0 auto;
   padding: 4px 14px;
   font-family: var(--font-monospace, monospace);
   font-size: 13px;
+}
+
+.agent-mcp-terminal-composer-raw-toggle {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.agent-mcp-terminal-composer-raw-toggle.is-active {
+  background: var(--text-accent);
+  color: var(--text-on-accent);
+}
+
+.agent-mcp-terminal-composer-input-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.agent-mcp-terminal-composer-textarea {
+  flex: 1 1 auto;
+  resize: none;
+  min-height: 36px;
+  max-height: 120px;
+  overflow-y: auto;
+  padding: 8px 10px;
+  border-radius: var(--radius-s, 6px);
+  font-family: inherit;
+  font-size: var(--font-ui-medium, 15px);
+  line-height: 1.35;
+}
+
+.agent-mcp-terminal-composer-textarea:disabled {
+  opacity: 0.5;
+}
+
+.agent-mcp-terminal-composer-send {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border-radius: 50%;
 }
 
 .agent-mcp-terminal-host {
